@@ -9,6 +9,8 @@ A WhatsApp bot powered by pi's coding-agent runtime. It executes bash/read/write
 - Persistent per-chat state (`log.jsonl`, `context.jsonl`, skills, memory)
 - Event scheduler (`immediate`, `one-shot`, `periodic`)
 - Inbound media download to `attachments/` and prompt context handoff
+- Automatic document text extraction for common formats (`.pdf`, `.docx`, `.xlsx`, `.pptx`, text/code files)
+- Artifact URL generation for files under `artifacts/files/`
 - Outbound reliability queue (messages/files queued while disconnected)
 - Group allowlist by JID and/or group name fragment
 - Optional verbose tool details in chat (`MOM_WA_VERBOSE_DETAILS=1`)
@@ -28,6 +30,12 @@ export MOM_WA_BOT_NAME="mom"
 export MOM_WA_ALLOWED_GROUPS="1203...@g.us,engineering"
 # Optional: show tool details/usage lines in chat
 export MOM_WA_VERBOSE_DETAILS=0
+# Optional: artifacts URL base (used by !artifact and auto-link on attach)
+export MOM_WA_ARTIFACTS_BASE_URL=https://example.trycloudflare.com
+# Optional: read base URL from a file (default: /tmp/artifacts-url.txt)
+export MOM_WA_ARTIFACTS_URL_FILE=/tmp/artifacts-url.txt
+# Optional: artifacts root on host (default: <working-dir>/artifacts/files)
+export MOM_WA_ARTIFACTS_ROOT=/path/to/data/artifacts/files
 # Optional: shared-number setup (bot and user use same WA account)
 export MOM_WA_ASSISTANT_HAS_OWN_NUMBER=1
 # Optional: model override (default: anthropic/claude-sonnet-4-6)
@@ -70,6 +78,9 @@ Use text commands in DM/group chats:
 - `!memory show [global|channel]` - show memory content
 - `!memory add <text>` - append to channel memory
 - `!memory add --global <text>` - append to global workspace memory
+- `!artifact status` - show artifacts root + configured base URL
+- `!artifact link <path>` - generate a public URL for an artifact file/path
+- `!artifact live <path>` - same as link, with `?ws=true` for live reload
 
 `/` prefix is also accepted (for example `/help`).
 
@@ -94,6 +105,9 @@ Options:
 | `MOM_WA_BOT_NAME` | no | Group trigger token (default: `mom`) |
 | `MOM_WA_ALLOWED_GROUPS` | no | CSV allowlist of group JIDs and/or group name fragments |
 | `MOM_WA_VERBOSE_DETAILS` | no | `1` to emit tool detail stream to chat, default off |
+| `MOM_WA_ARTIFACTS_BASE_URL` | no | Public base URL for artifact links (e.g. Cloudflare Tunnel URL) |
+| `MOM_WA_ARTIFACTS_URL_FILE` | no | File containing base URL (default `/tmp/artifacts-url.txt`) |
+| `MOM_WA_ARTIFACTS_ROOT` | no | Artifact root directory (default `<working-dir>/artifacts/files`) |
 | `MOM_WA_ASSISTANT_HAS_OWN_NUMBER` | no | `0` for shared-number setups (bot prefixes outbound text with bot name) |
 | `MOM_WA_MODEL` | no | Default model override, e.g. `anthropic/claude-sonnet-4-6` |
 | `MOM_WA_OWNER_JIDS` | no | Comma-separated owner JIDs allowed to run privileged chat commands (`!model`, `!thinking`, global memory writes) |
@@ -122,6 +136,9 @@ Options:
 - WhatsApp has no Slack-style threads, so details are either suppressed (default) or emitted directly in chat (`MOM_WA_VERBOSE_DETAILS=1`).
 - Message edit/delete semantics differ from Slack; final responses are follow-up messages.
 - Inbound media without text is still processed and forwarded as attachment context.
+- For non-image attachments, mom attempts automatic text extraction and includes extracted snippets in model context.
+- PDF/Office extraction requires `pdftotext` and `unzip` where extraction commands execute: in Docker sandbox mode this runs inside the sandbox container (`./docker.sh create` installs `poppler-utils` + `unzip` there); in host sandbox mode it uses host-installed binaries.
+- When `attach` uploads a file under artifacts root, mom auto-posts a public artifact URL if configured.
 - Shared-number mode (`MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0`) prefixes outbound text with bot name and avoids self-loop processing.
 
 ## Security
@@ -159,4 +176,6 @@ Key files:
 - `src/agent.ts` - agent runner/session/tool orchestration
 - `src/events.ts` - scheduled wakeups
 - `src/store.ts` - persistence/logging
+- `src/artifacts.ts` - artifact URL resolution
+- `src/attachment-extractor.ts` - document text extraction pipeline
 - `src/sandbox.ts` - host/docker execution adapter

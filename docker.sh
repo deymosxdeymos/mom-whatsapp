@@ -34,6 +34,14 @@ case "$1" in
       tail -f /dev/null
 
     if [ $? -eq 0 ]; then
+      echo "Installing runtime dependencies (unzip, poppler-utils)..."
+      if ! docker exec "$CONTAINER_NAME" /bin/sh -lc "apk add --no-cache unzip poppler-utils >/dev/null"; then
+        echo "Failed to install runtime dependencies inside container."
+        echo "Removing incomplete container '${CONTAINER_NAME}'..."
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+        exit 1
+      fi
+
       echo "Container created and running."
       echo ""
       echo "Run mom-whatsapp with: mom-whatsapp --sandbox=docker:${CONTAINER_NAME} $2"

@@ -3,7 +3,8 @@
 import { existsSync } from "fs";
 import { appendFile, readFile, writeFile } from "fs/promises";
 import { join, resolve } from "path";
-import { type AgentRunner, getOrCreateRunner } from "./agent.js";
+import { buildArtifactUrl, getArtifactsBaseUrl, getArtifactsRoot } from "./artifacts.js";
+import { type AgentRunner, getOrCreateRunner, translateToHostPath } from "./agent.js";
 import { createEventsWatcher } from "./events.js";
 import * as log from "./log.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
@@ -124,6 +125,9 @@ function formatHelp(): string {
 		"!memory show [global|channel]",
 		"!memory add <text>",
 		"!memory add --global <text>  # owner",
+		"!artifact status",
+		"!artifact link <path>",
+		"!artifact live <path>        # add ?ws=true",
 	].join("\n");
 }
 
@@ -140,6 +144,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 		const model = state.runner.getModel();
 		const thinking = state.runner.getThinkingLevel();
 		const ownerScoped = MOM_WA_OWNER_JIDS.length > 0;
+		const artifactBaseUrl = await getArtifactsBaseUrl();
 		const status = [
 			"*Mom status*",
 			`Connected: ${wa.isConnected() ? "yes" : "no"}`,
@@ -148,6 +153,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			`Thinking: ${thinking}`,
 			`Verbose details: ${MOM_WA_VERBOSE_DETAILS ? "on" : "off"}`,
 			`Queued outbound: ${wa.getOutgoingQueueSize()}`,
+			`Artifacts URL: ${artifactBaseUrl || "(not configured)"}`,
 			ownerScoped ? `Owner controls: enabled (${MOM_WA_OWNER_JIDS.length} jid)` : "Owner controls: disabled",
 		].join("\n");
 		await wa.postMessage(event.channel, status);
@@ -250,6 +256,62 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			return true;
 		}
 		await wa.postMessage(event.channel, "_Unknown memory command. Use show/add._");
+		return true;
+	}
+
+	if (command.name === "artifact" || command.name === "artifacts") {
+		const sub = command.args[0]?.toLowerCase() || "status";
+		if (sub === "status") {
+			const root = getArtifactsRoot(workingDir);
+			const baseUrl = await getArtifactsBaseUrl();
+			const status = [
+				"*Artifacts status*",
+				`Root: ${root}`,
+				`Base URL: ${baseUrl || "(not configured)"}`,
+				"Usage:",
+				"!artifact link <path>",
+				"!artifact live <path>",
+			].join("\n");
+			await wa.postMessage(event.channel, status);
+			return true;
+		}
+
+		if (sub === "link" || sub === "live") {
+			const requestedPath = command.args.slice(1).join(" ").trim();
+			if (!requestedPath) {
+				await wa.postMessage(event.channel, "_Usage: !artifact link <path> | !artifact live <path>_");
+				return true;
+			}
+
+			let resolvedArtifactPath = requestedPath;
+			const normalizedRequestedPath = requestedPath.replace(/\\/g, "/");
+			if (sandbox.type === "docker" && normalizedRequestedPath.startsWith("/workspace")) {
+				try {
+					resolvedArtifactPath = translateToHostPath(requestedPath, state.store.getChannelDir(event.channel), "/workspace");
+				} catch (err) {
+					await wa.postMessage(
+						event.channel,
+						`_Artifact URL error:_ [ARTIFACT_PATH_TRANSLATION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+					);
+					return true;
+				}
+			}
+
+			const result = await buildArtifactUrl({
+				workspaceDir: workingDir,
+				path: resolvedArtifactPath,
+				liveReload: sub === "live",
+			});
+			if (!result.ok) {
+				await wa.postMessage(event.channel, `_Artifact URL error:_ ${result.error}`);
+				return true;
+			}
+
+			await wa.postMessage(event.channel, `Artifact URL (${result.relativePath}): ${result.url}`);
+			return true;
+		}
+
+		await wa.postMessage(event.channel, "_Unknown artifact command. Use status|link|live._");
 		return true;
 	}
 

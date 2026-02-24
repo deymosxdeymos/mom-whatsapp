@@ -45,6 +45,24 @@ export async function validateSandbox(config: SandboxConfig): Promise<void> {
 		process.exit(1);
 	}
 
+	try {
+		await execSimple("docker", [
+			"exec",
+			config.container,
+			"sh",
+			"-lc",
+			"command -v pdftotext >/dev/null && command -v unzip >/dev/null",
+		]);
+	} catch {
+		console.error(
+			`Error [SANDBOX_MISSING_EXTRACTOR_DEPS]: Container '${config.container}' is missing required attachment extraction dependencies (pdftotext, unzip).`,
+		);
+		console.error(
+			`Install with: docker exec ${config.container} sh -lc 'apk add --no-cache poppler-utils unzip'`,
+		);
+		process.exit(1);
+	}
+
 	console.log(`  Docker container '${config.container}' is running.`);
 }
 

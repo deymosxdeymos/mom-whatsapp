@@ -23,6 +23,8 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { isAbsolute, join, relative, resolve as resolvePath } from "path";
+import { maybeBuildArtifactUrl } from "./artifacts.js";
+import { extractAttachmentText } from "./attachment-extractor.js";
 import { MomSettingsManager, syncLogToSessionManager } from "./context.js";
 import * as log from "./log.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
@@ -34,6 +36,9 @@ const DEFAULT_PROVIDER = "anthropic";
 const DEFAULT_MODEL_ID = "claude-sonnet-4-6";
 const MOM_WA_MODEL = process.env.MOM_WA_MODEL?.trim();
 const VERBOSE_DETAILS = process.env.MOM_WA_VERBOSE_DETAILS === "1";
+const MAX_EXTRACTED_ATTACHMENTS = 4;
+const MAX_PARALLEL_ATTACHMENT_EXTRACTIONS = 2;
+const ATTACHMENT_EXTRACTION_BUDGET_MS = 15000;
 
 const THINKING_LEVELS: ReadonlyArray<ThinkingLevel> = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -456,6 +461,87 @@ function extractToolResultText(result: unknown): string {
 	return JSON.stringify(result);
 }
 
+interface NonImageAttachment {
+	containerPath: string;
+	hostPath: string;
+	commandPath: string;
+}
+
+function formatAttachmentExtractForPrompt(path: string, method: string, text: string): string {
+	return [`<attachment_extract path="${path}" method="${method}">`, text, "</attachment_extract>"].join("\n");
+}
+
+async function extractAttachmentsForPrompt(
+	channelId: string,
+	attachments: NonImageAttachment[],
+	options: { commandPrefix?: string[] },
+): Promise<{ blocks: string[]; extractedCount: number }> {
+	const candidates = attachments.slice(0, MAX_EXTRACTED_ATTACHMENTS);
+	if (candidates.length === 0) {
+		return { blocks: [], extractedCount: 0 };
+	}
+
+	const deadlineMs = Date.now() + ATTACHMENT_EXTRACTION_BUDGET_MS;
+	const blocksByIndex: Array<string | null> = new Array(candidates.length).fill(null);
+	let extractedCount = 0;
+	let nextIndex = 0;
+
+	const workerCount = Math.min(MAX_PARALLEL_ATTACHMENT_EXTRACTIONS, candidates.length);
+	const workers: Array<Promise<void>> = [];
+	for (let workerIndex = 0; workerIndex < workerCount; workerIndex += 1) {
+		workers.push(
+			(async () => {
+				while (true) {
+					if (Date.now() >= deadlineMs) {
+						return;
+					}
+
+					const attachmentIndex = nextIndex;
+					if (attachmentIndex >= candidates.length) {
+						return;
+					}
+					nextIndex += 1;
+
+					const attachment = candidates[attachmentIndex];
+					const extracted = await extractAttachmentText(attachment.hostPath, {
+						deadlineMs,
+						commandPath: attachment.commandPath,
+						commandPrefix: options.commandPrefix,
+					});
+					if (!extracted) {
+						continue;
+					}
+
+					extractedCount += 1;
+					log.logInfo(
+						`[${channelId}] Extracted text from attachment ${attachment.containerPath} via ${extracted.method}`,
+					);
+					blocksByIndex[attachmentIndex] = formatAttachmentExtractForPrompt(
+						attachment.containerPath,
+						extracted.method,
+						extracted.text,
+					);
+				}
+			})(),
+		);
+	}
+
+	await Promise.all(workers);
+
+	const skippedByBudget = candidates.length - nextIndex;
+	if (skippedByBudget > 0) {
+		log.logWarning(
+			`[${channelId}] Stopped attachment extraction after ${ATTACHMENT_EXTRACTION_BUDGET_MS}ms budget`,
+			`${skippedByBudget} attachment(s) were not processed`,
+		);
+	}
+
+	return {
+		blocks: blocksByIndex.filter((block): block is string => block !== null),
+		extractedCount,
+	};
+}
+
 function formatToolArgsForChat(_toolName: string, args: Record<string, unknown>): string {
 	const lines: string[] = [];
 
@@ -509,6 +595,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const executor = createExecutor(sandboxConfig);
 	const hostWorkspacePath = join(channelDir, "..");
 	const workspacePath = executor.getWorkspacePath(hostWorkspacePath);
+	const attachmentExtractionCommandPrefix =
+		sandboxConfig.type === "docker" ? ["docker", "exec", sandboxConfig.container] : undefined;
 	const runUploadState = {
 		fn: null as ((filePath: string, title?: string) => Promise<void>) | null,
 	};
@@ -705,6 +793,22 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			if (VERBOSE_DETAILS) {
 				queue.enqueueMessage(threadMessage, "thread", "tool result thread", false);
+			}
+
+			if (!agentEvent.isError && agentEvent.toolName === "attach" && pending?.args) {
+				const attachPath = (pending.args as { path?: unknown }).path;
+				if (typeof attachPath === "string") {
+					let artifactUrl: string | null = null;
+					try {
+						const hostPath = translateToHostPath(attachPath, channelDir, workspacePath);
+						artifactUrl = await maybeBuildArtifactUrl({ workspaceDir: hostWorkspacePath, path: hostPath });
+					} catch {
+						artifactUrl = null;
+					}
+					if (artifactUrl) {
+						queue.enqueue(() => ctx.respond(`Artifact URL: ${artifactUrl}`), "artifact url");
+					}
+				}
 			}
 
 			if (agentEvent.isError) {
@@ -912,11 +1016,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			let userMessage = `[${timestamp}] [${ctx.message.userName || "unknown"}]: ${ctx.message.text}`;
 
 			const imageAttachments: ImageContent[] = [];
-			const nonImagePaths: string[] = [];
+			const nonImageAttachments: NonImageAttachment[] = [];
+			let extractedAttachmentCount = 0;
 
 			for (const a of ctx.message.attachments || []) {
 				const containerPath = `${workspacePath}/${a.local}`;
 				const hostPath = translateToHostPath(containerPath, channelDir, workspacePath);
+				const commandPath = sandboxConfig.type === "docker" ? containerPath : hostPath;
 				const mimeType = getImageMimeType(a.local);
 
 				if (mimeType && existsSync(hostPath)) {
@@ -927,15 +1033,26 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 							data: readFileSync(hostPath).toString("base64"),
 						});
 					} catch {
-						nonImagePaths.push(containerPath);
+						nonImageAttachments.push({ containerPath, hostPath, commandPath });
 					}
 				} else {
-					nonImagePaths.push(containerPath);
+					nonImageAttachments.push({ containerPath, hostPath, commandPath });
 				}
 			}
 
-			if (nonImagePaths.length > 0) {
-				userMessage += `\n\n<whatsapp_attachments>\n${nonImagePaths.join("\n")}\n</whatsapp_attachments>`;
+			if (nonImageAttachments.length > 0) {
+				userMessage +=
+					`\n\n<whatsapp_attachments>\n${nonImageAttachments.map((a) => a.containerPath).join("\n")}\n</whatsapp_attachments>`;
+
+				const extractionResult = await extractAttachmentsForPrompt(channelId, nonImageAttachments, {
+					commandPrefix: attachmentExtractionCommandPrefix,
+				});
+				extractedAttachmentCount = extractionResult.extractedCount;
+
+				if (extractionResult.blocks.length > 0) {
+					userMessage +=
+						`\n\n<whatsapp_attachment_extracts>\n${extractionResult.blocks.join("\n\n")}\n</whatsapp_attachment_extracts>`;
+				}
 			}
 
 			// Debug: write context to last_prompt.jsonl
@@ -944,6 +1061,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				messages: session.messages,
 				newUserMessage: userMessage,
 				imageAttachmentCount: imageAttachments.length,
+				nonImageAttachmentCount: nonImageAttachments.length,
+				extractedAttachmentCount,
 			};
 			await writeFile(join(channelDir, "last_prompt.jsonl"), JSON.stringify(debugContext, null, 2));
 
@@ -1064,7 +1183,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 /**
  * Translate container path back to host path for file operations
  */
-function translateToHostPath(containerPath: string, channelDir: string, workspacePath: string): string {
+export function translateToHostPath(containerPath: string, channelDir: string, workspacePath: string): string {
 	if (workspacePath === "/workspace") {
 		const normalizedContainerPath = containerPath.replace(/\\/g, "/");
 		const workspaceContainerRoot = "/workspace";
