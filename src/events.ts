@@ -3,6 +3,7 @@ import { existsSync, type FSWatcher, mkdirSync, readdirSync, statSync, unlinkSyn
 import { readFile } from "fs/promises";
 import { join } from "path";
 import * as log from "./log.js";
+import { appendTaskRunRecord } from "./task-runs.js";
 import type { WhatsAppBot, WhatsAppEvent } from "./whatsapp.js";
 
 export interface ImmediateEvent {
@@ -28,6 +29,11 @@ export interface PeriodicEvent {
 
 export type MomEvent = ImmediateEvent | OneShotEvent | PeriodicEvent;
 
+interface ParsedEventFile {
+	event: MomEvent;
+	paused: boolean;
+}
+
 const DEBOUNCE_MS = 100;
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 100;
@@ -41,6 +47,7 @@ export class EventsWatcher {
 	private knownFiles: Set<string> = new Set();
 
 	constructor(
+		private workspaceDir: string,
 		private eventsDir: string,
 		private wa: WhatsAppBot,
 	) {
@@ -144,13 +151,13 @@ export class EventsWatcher {
 
 	private async handleFile(filename: string): Promise<void> {
 		const filePath = join(this.eventsDir, filename);
-		let event: MomEvent | null = null;
+		let parsedEvent: ParsedEventFile | null = null;
 		let lastError: Error | null = null;
 
 		for (let i = 0; i < MAX_RETRIES; i++) {
 			try {
 				const content = await readFile(filePath, "utf-8");
-				event = this.parseEvent(content, filename);
+				parsedEvent = this.parseEvent(content, filename);
 				break;
 			} catch (err) {
 				lastError = err instanceof Error ? err : new Error(String(err));
@@ -160,7 +167,7 @@ export class EventsWatcher {
 			}
 		}
 
-		if (!event) {
+		if (!parsedEvent) {
 			log.logWarning(`Failed to parse event file after ${MAX_RETRIES} retries: ${filename}`, lastError?.message);
 			this.deleteFile(filename);
 			return;
@@ -168,40 +175,50 @@ export class EventsWatcher {
 
 		this.knownFiles.add(filename);
 
-		switch (event.type) {
+		if (parsedEvent.paused) {
+			log.logInfo(`Event paused, not scheduling: ${filename}`);
+			return;
+		}
+
+		switch (parsedEvent.event.type) {
 			case "immediate":
-				this.handleImmediate(filename, event);
+				this.handleImmediate(filename, parsedEvent.event);
 				break;
 			case "one-shot":
-				this.handleOneShot(filename, event);
+				this.handleOneShot(filename, parsedEvent.event);
 				break;
 			case "periodic":
-				this.handlePeriodic(filename, event);
+				this.handlePeriodic(filename, parsedEvent.event);
 				break;
 		}
 	}
 
-	private parseEvent(content: string, filename: string): MomEvent {
-		const data = JSON.parse(content) as Partial<MomEvent>;
+	private parseEvent(content: string, filename: string): ParsedEventFile {
+		const data = JSON.parse(content) as Partial<MomEvent> & { paused?: unknown };
 		if (!data.type || !data.channelId || !data.text) {
 			throw new Error(`Missing required fields (type, channelId, text) in ${filename}`);
 		}
 
+		const paused = data.paused === true;
+
 		switch (data.type) {
 			case "immediate":
-				return { type: "immediate", channelId: data.channelId, text: data.text };
+				return { event: { type: "immediate", channelId: data.channelId, text: data.text }, paused };
 			case "one-shot":
 				if (!data.at) throw new Error(`Missing 'at' field for one-shot event in ${filename}`);
-				return { type: "one-shot", channelId: data.channelId, text: data.text, at: data.at };
+				return { event: { type: "one-shot", channelId: data.channelId, text: data.text, at: data.at }, paused };
 			case "periodic":
 				if (!data.schedule) throw new Error(`Missing 'schedule' field for periodic event in ${filename}`);
 				if (!data.timezone) throw new Error(`Missing 'timezone' field for periodic event in ${filename}`);
 				return {
-					type: "periodic",
-					channelId: data.channelId,
-					text: data.text,
-					schedule: data.schedule,
-					timezone: data.timezone,
+					event: {
+						type: "periodic",
+						channelId: data.channelId,
+						text: data.text,
+						schedule: data.schedule,
+						timezone: data.timezone,
+					},
+					paused,
 				};
 			default:
 				throw new Error(`Unknown event type '${String(data.type)}' in ${filename}`);
@@ -265,6 +282,7 @@ export class EventsWatcher {
 	}
 
 	private execute(filename: string, event: MomEvent, deleteAfter = true): void {
+		const runStart = Date.now();
 		const scheduleInfo =
 			event.type === "immediate" ? "immediate" : event.type === "one-shot" ? event.at : event.schedule;
 		const syntheticEvent: WhatsAppEvent = {
@@ -272,7 +290,7 @@ export class EventsWatcher {
 			channel: event.channelId,
 			user: "EVENT",
 			text: `[EVENT:${filename}:${event.type}:${scheduleInfo}] ${event.text}`,
-			ts: Date.now().toString(),
+			ts: runStart.toString(),
 			attachments: [],
 		};
 
@@ -283,6 +301,19 @@ export class EventsWatcher {
 			log.logWarning(`Event queue full, discarded: ${filename}`);
 			this.deleteFile(filename);
 		}
+
+		void appendTaskRunRecord(this.workspaceDir, {
+			taskId: filename.replace(/\.json$/i, ""),
+			filename,
+			channelId: event.channelId,
+			eventType: event.type,
+			runAtIso: new Date(runStart).toISOString(),
+			durationMs: Date.now() - runStart,
+			status: enqueued ? "success" : "error",
+			error: enqueued ? undefined : "Event queue full",
+		}).catch((err: unknown) => {
+			log.logWarning(`Failed to persist task run record for ${filename}`, String(err));
+		});
 	}
 
 	private deleteFile(filename: string): void {
@@ -304,5 +335,5 @@ export class EventsWatcher {
 
 export function createEventsWatcher(workspaceDir: string, wa: WhatsAppBot): EventsWatcher {
 	const eventsDir = join(workspaceDir, "events");
-	return new EventsWatcher(eventsDir, wa);
+	return new EventsWatcher(workspaceDir, eventsDir, wa);
 }

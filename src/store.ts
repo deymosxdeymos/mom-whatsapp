@@ -11,6 +11,7 @@ export interface LoggedMessage {
 	date: string;
 	ts: string;
 	messageId?: string;
+	botMessageIds?: string[];
 	user: string;
 	userName?: string;
 	displayName?: string;
@@ -76,11 +77,17 @@ export class ChannelStore {
 		return true;
 	}
 
-	async logBotResponse(channelId: string, text: string, ts: string): Promise<void> {
+	async logBotResponse(channelId: string, text: string, messageIds: string[]): Promise<void> {
+		const normalizedMessageIds = Array.from(
+			new Set(messageIds.map((messageId) => messageId.trim()).filter((messageId) => messageId.length > 0)),
+		);
+		const primaryMessageId = normalizedMessageIds[normalizedMessageIds.length - 1] ?? `${Date.now()}`;
+
 		await this.logMessage(channelId, {
 			date: new Date().toISOString(),
-			ts,
-			messageId: ts,
+			ts: primaryMessageId,
+			messageId: primaryMessageId,
+			botMessageIds: normalizedMessageIds,
 			user: "bot",
 			text,
 			attachments: [],

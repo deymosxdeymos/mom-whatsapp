@@ -13,9 +13,10 @@ If the user request is not concrete, read `README.md` and ask which area to work
 - `npm run check` currently runs TypeScript typecheck only
 - Do not run long-lived commands unless explicitly requested
 
-## Git
-- Never use destructive commands (`git reset --hard`, `git checkout .`, `git clean -fd`)
-- Stage specific files only (no `git add .`)
+## Jujutsu (jj)
+- Use `jj` for day-to-day VCS commands
+- Never use destructive commands that discard uncommitted work
+- Stage specific files only
 - Commit only after checks pass and user asks
 
 ## Style

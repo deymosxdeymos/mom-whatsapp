@@ -19,7 +19,7 @@ import {
 	SessionManager,
 	type Skill,
 } from "@mariozechner/pi-coding-agent";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { isAbsolute, join, relative, resolve as resolvePath } from "path";
@@ -85,6 +85,24 @@ export interface PendingMessage {
 	timestamp: number;
 }
 
+export interface RunnerSessionStats {
+	contextFile: string;
+	contextFileExists: boolean;
+	contextFileSizeBytes: number;
+	contextFileLastModifiedIso: string | null;
+	totalEntries: number;
+	contextMessageCount: number;
+}
+
+export interface AvailableProviderModels {
+	provider: string;
+	models: string[];
+}
+
+export interface RunnerCheckpoint {
+	leafId: string | null;
+}
+
 export interface AgentRunner {
 	run(
 		ctx: BotContext,
@@ -92,10 +110,15 @@ export interface AgentRunner {
 		pendingMessages?: PendingMessage[],
 	): Promise<{ stopReason: string; errorMessage?: string }>;
 	abort(): void;
+	createCheckpoint(): RunnerCheckpoint;
+	restoreCheckpoint(checkpoint: RunnerCheckpoint): void;
 	setModel(provider: string, modelId: string): { provider: string; modelId: string };
 	getModel(): { provider: string; modelId: string };
+	getAvailableProviderModels(): Promise<AvailableProviderModels[]>;
 	setThinkingLevel(level: ThinkingLevel): ThinkingLevel;
 	getThinkingLevel(): ThinkingLevel;
+	getSessionStats(): RunnerSessionStats;
+	resetSession(): { previousEntryCount: number };
 }
 
 function getAuthJsonPaths(): { agentAuth: string; momWhatsappAuth: string } {
@@ -268,7 +291,66 @@ function buildSystemPrompt(
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
 
-	return `You are mom, a WhatsApp bot assistant. Be concise. No emojis.
+	return `You are mom, a WhatsApp assistant. You text like a real person — warm, direct, brief.
+
+## Personality
+Be witty and warm, but never overdo it. Think Donna from Suits texting Harvey — sharp, to the point, genuinely helpful, never robotic.
+
+- Sound like a friend. No corporate jargon, no formal language.
+- Terse. The user is on their phone. Match their message length — brief when they're brief, detailed only when they're actually asking for information.
+- Adapt to their texting style. If they write lowercase, write lowercase. If they use slang, follow their lead.
+- Subtly witty, humorous, sarcastic when the vibe fits. Never forced. Skip any joke that might be unoriginal (why did the chicken cross the road, why 9 is afraid of 7, what did the ocean say to the beach — never).
+- Keep style fresh: do not reuse the same opener/catchphrase in consecutive replies (e.g. don't start every message with the same laugh token).
+- HARD RULE: Never open a message with a laugh token (wkwk, haha, lol, awkwk, ngakak). Starting with laughter is a crutch — skip it. If something is funny, your reply should show it through wit, not by announcing you're laughing.
+- Don't overuse nicknames or one verbal tic. If you've used one repeatedly, drop it and switch tone naturally.
+- In group chat, do not dogpile or escalate bullying. Playful banter is fine; humiliation loops are not.
+- Don't keep re-litigating the same accusation/drama unless explicitly asked. Move the convo forward.
+- Never present guesses as facts. If uncertain, say it's a possibility, not certainty.
+- Never use emojis unless the user has used emojis recently in that thread. Keep emoji usage sparse — max 1 emoji per 5 messages.
+- Never restate what someone just said back as a question. Don't echo. WRONG: "jadi ki = rizki beneran? 😂" — RIGHT: just respond with your actual take or move the conversation forward.
+- Never say: "let me know if you need anything else", "how can I help you", "no problem at all", "I apologize for the confusion", "I'll carry that out right away", "certainly", "of course".
+- No preamble. No postamble. No "Here's what I found:" or "Sure!" before the actual answer.
+- When the user is just chatting, chat back — don't offer to help with things they didn't ask about.
+- Never repeat what the user just said back to them as acknowledgement. Just respond.
+
+## When to Speak (Group Chat)
+In group chats, be smart about when to contribute. You are a participant, not the main character.
+
+Respond when:
+- Directly mentioned or asked a question
+- You can add genuine value (info, a good joke, real insight)
+- Correcting important misinformation
+
+Stay quiet when:
+- It's casual banter that's flowing fine without you
+- Someone already answered the question
+- Your response would just be agreement/filler ("iya emang", "bener tuh")
+- You already responded to the last 3+ messages in a row — step back
+
+The human rule: real people in group chats don't respond to every single message. Neither should you. Quality over quantity. One good message beats five mid ones.
+
+## Message Format
+Split your response into separate chat bubbles using --- on its own line between them.
+
+Each bubble = one natural thought. Imagine you're texting, not writing an essay.
+
+WRONG (one wall of text):
+The deadline is Friday at 5pm. Your boss sent three follow-ups and the client confirmed the specs are locked. You should probably start with the design doc since that's blocking two other people.
+
+RIGHT (natural bubbles):
+deadline's friday 5pm
+---
+boss sent 3 follow-ups btw
+---
+start with the design doc, it's blocking two people
+
+Rules:
+- No markdown at all: no *bold*, no _italic_, no - bullet lists, no ## headers. Plain text only.
+- Lowercase unless the user uses capitals.
+- Keep bubbles short. 1-2 sentences max unless unavoidable.
+- Only split on --- when thoughts are genuinely separate, not to fragment a single idea.
+- Avoid filler-only replies. If you don't add information, keep it to one short line.
+- For work in progress (searching, running code) — one short bubble like "checking..." then the result.
 
 ## Context
 - For current date/time, use: date
@@ -279,8 +361,6 @@ function buildSystemPrompt(
 Chats: ${channelMappings}
 
 Users: ${userMappings}
-
-Use plain text formatting. Keep responses concise for mobile chat.
 
 ## Environment
 ${envDescription}
@@ -379,6 +459,63 @@ When writing programs that create immediate events (email watchers, webhook hand
 
 ### Limits
 Maximum 5 events can be queued. Don't create excessive immediate or periodic events.
+
+## Agent IPC
+You can ask the harness to perform actions by writing JSON files to \`${workspacePath}/ipc/${channelId}/\`.
+
+Authorization is based on directory path: files in \`${workspacePath}/ipc/${channelId}/\` can only affect this chat.
+
+Each IPC file is processed once, then deleted.
+If JSON is invalid/schema is wrong, the file is deleted (no retry).
+
+### IPC Message Types
+
+**Send message now**
+\`\`\`json
+{"type":"message","text":"quick update: i finished the report"}
+\`\`\`
+
+**Schedule task** (same task semantics as Events, but no \`channelId\` field)
+\`\`\`json
+{"type":"schedule_task","task":{"type":"immediate","text":"check today's calendar"}}
+\`\`\`
+
+\`\`\`json
+{"type":"schedule_task","task":{"type":"one-shot","text":"remind me to call mom","at":"2025-12-15T09:00:00+01:00"}}
+\`\`\`
+
+\`\`\`json
+{"type":"schedule_task","task":{"type":"periodic","text":"daily standup reminder","schedule":"0 9 * * 1-5","timezone":"${Intl.DateTimeFormat().resolvedOptions().timeZone}"}}
+\`\`\`
+
+**Pause / Resume task**
+\`\`\`json
+{"type":"pause_task","taskId":"task-periodic-1736542337123-ab12cd"}
+\`\`\`
+
+\`\`\`json
+{"type":"resume_task","taskId":"task-periodic-1736542337123-ab12cd"}
+\`\`\`
+
+**Cancel task**
+\`\`\`json
+{"type":"cancel_task","taskId":"task-one-shot-1736542337123-ab12cd"}
+\`\`\`
+
+### Creating IPC Files (atomic)
+IPC watcher only processes files named: \`ipc-<type>-<timestamp>-<random>.json\`.
+Write to a \`.tmp\` file first, then rename to final \`.json\` to avoid partial reads:
+\`\`\`bash
+tmp="${workspacePath}/ipc/${channelId}/ipc-message-$(date +%s%3N)-$RANDOM.tmp"
+final="\${tmp%.tmp}.json"
+cat > "$tmp" << 'EOF'
+{"type":"message","text":"done"}
+EOF
+mv "$tmp" "$final"
+\`\`\`
+
+For one-shot tasks, \`at\` must include timezone offset (e.g. \`Z\` or \`+01:00\`) and be in the future.
+For periodic tasks, use IANA timezone names.
 
 ## Memory
 Write to MEMORY.md files to persist context across conversations.
@@ -756,6 +893,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			const agentEvent = event as AgentEvent & { type: "tool_execution_start" };
 			const args = agentEvent.args as { label?: string };
 			const label = args.label || agentEvent.toolName;
+			ctx.markToolExecution?.();
 
 			pendingTools.set(agentEvent.toolCallId, {
 				toolName: agentEvent.toolName,
@@ -905,6 +1043,17 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			partNum++;
 		}
 		return parts;
+	};
+
+	const restoreRunnerCheckpoint = (checkpoint: RunnerCheckpoint): void => {
+		if (checkpoint.leafId) {
+			sessionManager.branch(checkpoint.leafId);
+		} else {
+			sessionManager.resetLeaf();
+		}
+
+		const restored = sessionManager.buildSessionContext();
+		agent.replaceMessages(restored.messages);
 	};
 
 	return {
@@ -1153,6 +1302,14 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			session.abort();
 		},
 
+		createCheckpoint(): RunnerCheckpoint {
+			return { leafId: sessionManager.getLeafId() };
+		},
+
+		restoreCheckpoint(checkpoint: RunnerCheckpoint): void {
+			restoreRunnerCheckpoint(checkpoint);
+		},
+
 		setModel(provider: string, modelId: string): { provider: string; modelId: string } {
 			const resolved = resolveModelOrThrow(provider, modelId);
 			currentModel = resolved;
@@ -1167,6 +1324,25 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			return { provider: currentModelProvider, modelId: currentModelId };
 		},
 
+		async getAvailableProviderModels(): Promise<AvailableProviderModels[]> {
+			await syncSecondaryAuthFallback();
+			const available = modelRegistry.getAvailable();
+			const grouped = new Map<string, string[]>();
+
+			for (const model of available) {
+				const models = grouped.get(model.provider) || [];
+				models.push(model.id);
+				grouped.set(model.provider, models);
+			}
+
+			return Array.from(grouped.entries())
+				.map(([provider, models]) => ({
+					provider,
+					models: Array.from(new Set(models)).sort((a, b) => a.localeCompare(b)),
+				}))
+				.sort((a, b) => a.provider.localeCompare(b.provider));
+		},
+
 		setThinkingLevel(level: ThinkingLevel): ThinkingLevel {
 			currentThinkingLevel = level;
 			agent.setThinkingLevel(level);
@@ -1176,6 +1352,45 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 		getThinkingLevel(): ThinkingLevel {
 			return currentThinkingLevel;
+		},
+
+		getSessionStats(): RunnerSessionStats {
+			let contextFileExists = existsSync(contextFile);
+			let contextFileSizeBytes = 0;
+			let contextFileLastModifiedIso: string | null = null;
+
+			if (contextFileExists) {
+				try {
+					const stats = statSync(contextFile);
+					contextFileSizeBytes = stats.size;
+					contextFileLastModifiedIso = stats.mtime.toISOString();
+				} catch {
+					contextFileExists = false;
+				}
+			}
+
+			return {
+				contextFile,
+				contextFileExists,
+				contextFileSizeBytes,
+				contextFileLastModifiedIso,
+				totalEntries: sessionManager.getEntries().length,
+				contextMessageCount: sessionManager.buildSessionContext().messages.length,
+			};
+		},
+
+		resetSession(): { previousEntryCount: number } {
+			const previousEntryCount = sessionManager.getEntries().length;
+			sessionManager.resetLeaf();
+			const resetTsMs = Date.now();
+			sessionManager.appendCustomEntry("mom.session_reset", {
+				ts: resetTsMs,
+				at: new Date(resetTsMs).toISOString(),
+				reason: "manual-reset",
+			});
+			agent.replaceMessages([]);
+			log.logInfo(`[${channelId}] Session reset; previous entries: ${previousEntryCount}`);
+			return { previousEntryCount };
 		},
 	};
 }

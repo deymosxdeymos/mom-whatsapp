@@ -10,15 +10,18 @@ import makeWASocket, {
 	type WASocket,
 } from "@whiskeysockets/baileys";
 import { existsSync, mkdirSync, readFileSync } from "fs";
-import { writeFile } from "fs/promises";
+import { open, writeFile } from "fs/promises";
 import { basename, extname, join } from "path";
-import qrcode from "qrcode-terminal";
+import { normalizeWhatsAppJid } from "./jid.js";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore } from "./store.js";
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_OUTGOING_QUEUE = 200;
-const MOM_WA_PAIRING_PHONE = process.env.MOM_WA_PAIRING_PHONE?.trim();
+const BOT_LOG_LOOKUP_MAX_LINES = 200;
+const BOT_LOG_TAIL_BYTES = 128 * 1024;
+const BOT_LOG_CACHE_MAX_IDS_PER_CHANNEL = 2000;
+const MOM_WA_DEBUG_INCOMING = process.env.MOM_WA_DEBUG_INCOMING === "1";
 
 export interface WhatsAppEvent {
 	type: "mention" | "dm";
@@ -72,6 +75,7 @@ export interface BotContext {
 	uploadFile: (filePath: string, title?: string) => Promise<void>;
 	setWorking: (working: boolean) => Promise<void>;
 	deleteMessage: () => Promise<void>;
+	markToolExecution?: () => void;
 }
 
 export interface MomHandler {
@@ -135,6 +139,7 @@ interface WhatsAppBotConfig {
 	botName: string;
 	allowedGroups: string[];
 	assistantHasOwnNumber: boolean;
+	groupTriggerAliases?: string[];
 	deps?: Partial<WhatsAppDependencies>;
 }
 
@@ -186,11 +191,13 @@ export class WhatsAppBot {
 	private botJids = new Set<string>();
 	private lidToPhoneMap = new Map<string, string>();
 	private recentOutboundMessageIds = new Map<string, number>();
+	private botLoggedMessageIds = new Map<string, Set<string>>();
+	private botLogCacheLoadPromises = new Map<string, Promise<void>>();
+	private botLogCacheLoadedChannels = new Set<string>();
 	private outgoingQueue: PendingOutbound[] = [];
 	private flushingOutgoing = false;
 	private outgoingRetryScheduled = false;
 	private groupSyncTimerStarted = false;
-	private pairingCodeRequested = false;
 	private reconnectDelay = 5000;
 
 	constructor(handler: MomHandler, config: WhatsAppBotConfig) {
@@ -212,6 +219,11 @@ export class WhatsAppBot {
 
 	private async connect(onFirstOpen?: () => void): Promise<void> {
 		const { state, saveCreds } = await this.deps.useAuthState(this.config.authDir);
+		if (state.creds.registered !== true) {
+			log.logWarning("WhatsApp auth required. Run `npm run wa:auth` before starting mom-whatsapp.");
+			throw new Error("WhatsApp auth not initialized");
+		}
+
 		const { version, isLatest } = await fetchLatestWaWebVersion().catch(() => ({
 			version: [2, 3000, 1027934701] as [number, number, number],
 			isLatest: false,
@@ -227,27 +239,19 @@ export class WhatsAppBot {
 			browser: Browsers.macOS("Chrome"),
 		});
 
-		void this.requestPairingCodeIfConfigured(state.creds);
-
 		this.sock.ev.on("creds.update", saveCreds);
 		this.sock.ev.on("connection.update", (update) => {
 			log.logInfo(
 				`connection.update — connection: ${update.connection ?? "none"}, hasQR: ${!!update.qr}, hasError: ${!!update.lastDisconnect?.error}`,
 			);
 			if (update.qr) {
-				if (MOM_WA_PAIRING_PHONE) {
-					log.logInfo("WhatsApp QR received (pairing code will be used instead of QR).");
-				} else {
-					log.logInfo("WhatsApp QR received. Scan in WhatsApp > Linked devices > Link a device.");
-					qrcode.generate(update.qr, { small: true });
-					log.logWarning("No pairing phone configured. Exiting so the QR can be scanned on restart.");
-					process.exit(1);
-				}
+				log.logWarning("WhatsApp auth expired or missing. Run `npm run wa:auth`, then restart mom-whatsapp.");
+				process.exit(1);
+				return;
 			}
 
 			if (update.connection === "open") {
 				this.connected = true;
-				this.pairingCodeRequested = false;
 				this.reconnectDelay = 5000;
 				this.registerBotJids();
 				log.logInfo("Connected to WhatsApp");
@@ -281,9 +285,11 @@ export class WhatsAppBot {
 			log.logWarning(
 				`WhatsApp disconnect — statusCode: ${statusCode}, message: ${disconnectError instanceof Error ? disconnectError.message : String(disconnectError)}, data: ${JSON.stringify(errorData)}`,
 			);
+
 			if (statusCode === DisconnectReason.loggedOut) {
-				log.logWarning("WhatsApp logged out; restart and scan QR again");
+				log.logWarning("WhatsApp logged out. Run `npm run wa:auth`, then restart mom-whatsapp.");
 				process.exit(1);
+				return;
 			}
 
 			log.logWarning(`WhatsApp disconnected, reconnecting in ${this.reconnectDelay / 1000}s...`);
@@ -301,44 +307,11 @@ export class WhatsAppBot {
 		});
 	}
 
-	private async requestPairingCodeIfConfigured(creds: { registered?: boolean; me?: unknown }): Promise<void> {
-		if (!MOM_WA_PAIRING_PHONE || !this.sock) return;
-		if (creds.registered) return;
-		if (this.pairingCodeRequested) return;
-
-		const phoneNumber = MOM_WA_PAIRING_PHONE.replace(/[^\d]/g, "");
-		if (!phoneNumber) {
-			log.logWarning("MOM_WA_PAIRING_PHONE is set but no digits were found");
-			return;
-		}
-
-		this.pairingCodeRequested = true;
-		this.deps.setTimeout(() => {
-			void (async () => {
-				if (!this.sock) {
-					this.pairingCodeRequested = false;
-					return;
-				}
-				try {
-					const code = await this.sock.requestPairingCode(phoneNumber);
-					log.logInfo(`WhatsApp pairing code: ${code}`);
-					log.logInfo("Use WhatsApp > Linked Devices > Link with phone number instead, then enter the code.");
-				} catch (err) {
-					this.pairingCodeRequested = false;
-					log.logWarning(
-						"Failed to request WhatsApp pairing code",
-						err instanceof Error ? err.message : String(err),
-					);
-				}
-			})();
-		}, 500);
-	}
-
 	private registerBotJids(): void {
 		if (!this.sock?.user) return;
-		const primary = this.normalizeJid(this.sock.user.id);
+		const primary = normalizeWhatsAppJid(this.sock.user.id);
 		this.botJids.add(primary);
-		const lid = this.sock.user.lid ? this.normalizeJid(this.sock.user.lid) : undefined;
+		const lid = this.sock.user.lid ? normalizeWhatsAppJid(this.sock.user.lid) : undefined;
 		if (lid) {
 			this.botJids.add(lid);
 			this.lidToPhoneMap.set(lid.split("@")[0], primary);
@@ -350,9 +323,9 @@ export class WhatsAppBot {
 		if (msg.key.remoteJid === "status@broadcast") return;
 		if (this.isRecentOutboundMessageId(msg.key.id || undefined)) return;
 
-		const channelId = await this.translateJid(msg.key.remoteJid);
+		const channelId = normalizeWhatsAppJid(await this.translateJid(msg.key.remoteJid));
 		const senderRaw = msg.key.participant || msg.key.remoteJid;
-		const sender = await this.translateJid(senderRaw);
+		const sender = normalizeWhatsAppJid(await this.translateJid(senderRaw));
 		const userName = msg.pushName || sender.split("@")[0];
 		const text = this.extractText(msg.message);
 		const tsMs = this.timestampToMs(msg.messageTimestamp);
@@ -371,24 +344,29 @@ export class WhatsAppBot {
 		if (!isDm && !channelId.endsWith("@g.us")) return;
 		if (!isDm && !this.isGroupAllowed(channelId)) return;
 
-		const cleanedText = isDm ? text.trim() : this.stripMention(text).trim();
+		const cleanedText = isDm ? text.trim() : this.stripMention(text, msg.message).trim();
 		const stopRequested = this.isStopCommandText(cleanedText || text);
 
-		const botTriggered =
-			isDm ||
-			this.isMentioned(text, msg.message) ||
-			this.isReplyToBotMessage(msg.message) ||
-			(stopRequested && this.handler.isRunning(channelId));
+		const mentioned = this.isMentioned(text, msg.message);
+		const repliedToBot = await this.isReplyToBotMessage(channelId, msg.message);
+		const botTriggered = isDm || mentioned || repliedToBot || (stopRequested && this.handler.isRunning(channelId));
+		if (MOM_WA_DEBUG_INCOMING && !isDm) {
+			log.logInfo(
+				`[debug:incoming] channel=${channelId} sender=${sender} raw=${JSON.stringify(text)} cleaned=${JSON.stringify(cleanedText)} mention=${mentioned} reply=${repliedToBot} stop=${stopRequested} triggered=${botTriggered}`,
+			);
+		}
 		if (!botTriggered) return;
 
 		const attachments = stopRequested ? [] : await this.downloadMediaAttachments(channelId, msg, tsMs);
-		if (!stopRequested && !cleanedText && attachments.length === 0) return;
+		// Only drop if there's truly nothing — bare @mentions are valid triggers,
+		// so let them through with a neutral fallback rather than silently ignoring.
+		if (!stopRequested && !cleanedText && attachments.length === 0 && !mentioned) return;
 
 		const event: WhatsAppEvent = {
 			type: isDm ? "dm" : "mention",
 			channel: channelId,
 			user: sender,
-			text: stopRequested ? "stop" : cleanedText || "Please analyze the attached files.",
+			text: stopRequested ? "stop" : cleanedText || (attachments.length > 0 ? "Please analyze the attached files." : "hey"),
 			ts: String(tsMs),
 			attachments,
 			messageKey: msg.key,
@@ -400,6 +378,7 @@ export class WhatsAppBot {
 			return;
 		}
 
+
 		if (event.text.toLowerCase() === "stop") {
 			if (this.handler.isRunning(channelId)) {
 				await this.handler.handleStop(channelId, this);
@@ -409,12 +388,15 @@ export class WhatsAppBot {
 			return;
 		}
 
-		if (this.handler.isRunning(channelId)) {
-			await this.postMessage(channelId, "_Already working. Send `stop` to cancel._");
+		// Queue the event. The ChannelQueue serializes naturally — if a run is active,
+		// this message waits and is processed immediately after. Nanoclaw-style: messages
+		// accumulate rather than getting dropped. Cap at 4 queued to avoid unbounded backlog.
+		const queue = this.getQueue(channelId);
+		if (queue.size() >= 4) {
+			log.logWarning(`[${channelId}] Message queue full (${queue.size()}), dropping`);
 			return;
 		}
-
-		this.getQueue(channelId).enqueue(() => this.handler.handleEvent(event, this));
+		queue.enqueue(() => this.handler.handleEvent(event, this));
 	}
 
 	private async logUserMessage(event: WhatsAppEvent, userName: string): Promise<void> {
@@ -463,11 +445,104 @@ export class WhatsAppBot {
 		this.recentOutboundMessageIds.set(messageId, Date.now());
 	}
 
+	private rememberBotLoggedMessageId(channelId: string, messageId: string): void {
+		if (!messageId) return;
+		let ids = this.botLoggedMessageIds.get(channelId);
+		if (!ids) {
+			ids = new Set<string>();
+			this.botLoggedMessageIds.set(channelId, ids);
+		}
+		ids.add(messageId);
+		while (ids.size > BOT_LOG_CACHE_MAX_IDS_PER_CHANNEL) {
+			const oldest = ids.values().next().value as string | undefined;
+			if (!oldest) break;
+			ids.delete(oldest);
+		}
+	}
+
+	private async ensureBotLogCacheLoaded(channelId: string): Promise<void> {
+		if (this.botLogCacheLoadedChannels.has(channelId)) {
+			return;
+		}
+		if (this.botLogCacheLoadPromises.has(channelId)) {
+			await this.botLogCacheLoadPromises.get(channelId);
+			return;
+		}
+
+		const loadPromise = this.loadBotLogCache(channelId)
+			.catch((err) => {
+				log.logWarning(
+					`[${channelId}] Failed to load bot message cache`,
+					err instanceof Error ? err.message : String(err),
+				);
+			})
+			.finally(() => {
+				this.botLogCacheLoadPromises.delete(channelId);
+				this.botLogCacheLoadedChannels.add(channelId);
+			});
+		this.botLogCacheLoadPromises.set(channelId, loadPromise);
+		await loadPromise;
+	}
+
+	private async loadBotLogCache(channelId: string): Promise<void> {
+		const logPath = join(this.config.store.getChannelDir(channelId), "log.jsonl");
+		if (!existsSync(logPath)) return;
+
+		const handle = await open(logPath, "r");
+		try {
+			const stats = await handle.stat();
+			if (stats.size <= 0) return;
+
+			const bytesToRead = Math.min(Number(stats.size), BOT_LOG_TAIL_BYTES);
+			const start = Math.max(0, Number(stats.size) - bytesToRead);
+			const buffer = Buffer.alloc(bytesToRead);
+			const readResult = await handle.read(buffer, 0, bytesToRead, start);
+			let content = buffer.subarray(0, readResult.bytesRead).toString("utf-8");
+			if (start > 0) {
+				const firstNewline = content.indexOf("\n");
+				content = firstNewline >= 0 ? content.slice(firstNewline + 1) : "";
+			}
+
+			const trimmed = content.trim();
+			if (!trimmed) return;
+
+			const lines = trimmed.split("\n");
+			const startIndex = Math.max(0, lines.length - BOT_LOG_LOOKUP_MAX_LINES);
+			for (let i = startIndex; i < lines.length; i += 1) {
+				const line = lines[i];
+				if (!line) continue;
+				let parsed: { messageId?: string; botMessageIds?: string[]; isBot?: boolean };
+				try {
+					parsed = JSON.parse(line) as { messageId?: string; botMessageIds?: string[]; isBot?: boolean };
+				} catch {
+					continue;
+				}
+				if (parsed.isBot !== true) {
+					continue;
+				}
+				if (Array.isArray(parsed.botMessageIds)) {
+					for (const messageId of parsed.botMessageIds) {
+						if (typeof messageId === "string" && messageId.length > 0) {
+							this.rememberBotLoggedMessageId(channelId, messageId);
+						}
+					}
+				}
+				if (parsed.messageId) {
+					this.rememberBotLoggedMessageId(channelId, parsed.messageId);
+				}
+			}
+		} finally {
+			await handle.close();
+		}
+	}
+
 	private isMentioned(text: string, message: proto.IMessage | null | undefined): boolean {
-		const mentionRegex = new RegExp(`(?:^|\\s)@?${escapeRegex(this.config.botName)}(?:\\b|\\s|$)`, "i");
-		if (mentionRegex.test(text)) return true;
+		for (const trigger of this.getGroupTriggerTokens()) {
+			const mentionRegex = new RegExp(`(?:^|\\s)@?${escapeRegex(trigger)}(?:\\b|\\s|$)`, "i");
+			if (mentionRegex.test(text)) return true;
+		}
 		const mentionedJids = this.getMentionedJids(message);
-		return mentionedJids.some((jid) => this.botJids.has(this.normalizeJid(jid)));
+		return mentionedJids.some((jid) => this.botJids.has(normalizeWhatsAppJid(jid)));
 	}
 
 	private isStopCommandText(text: string): boolean {
@@ -475,12 +550,40 @@ export class WhatsAppBot {
 		return normalized === "stop" || normalized === "!stop" || normalized === "/stop";
 	}
 
-	private stripMention(text: string): string {
-		const escaped = escapeRegex(this.config.botName);
-		return text
-			.replace(new RegExp(`(?:^|\\s)@?${escaped}(?:\\b|\\s|$)`, "ig"), " ")
-			.replace(/\s+/g, " ")
-			.trim();
+	private stripMention(text: string, message: proto.IMessage | null | undefined): string {
+		let stripped = text;
+		for (const trigger of this.getGroupTriggerTokens()) {
+			stripped = stripped.replace(new RegExp(`(?:^|\\s)@?${escapeRegex(trigger)}(?:\\b|\\s|$)`, "ig"), " ");
+		}
+
+		const mentionedJids = this.getMentionedJids(message);
+		const botMentionedByJid = mentionedJids.some((jid) => this.botJids.has(normalizeWhatsAppJid(jid)));
+		if (botMentionedByJid) {
+			for (const botJid of this.botJids) {
+				const alias = this.extractJidUserPart(botJid);
+				if (!alias) continue;
+				stripped = stripped.replace(new RegExp(`(?:^|\\s)@?${escapeRegex(alias)}(?:\\b|\\s|$)`, "ig"), " ");
+			}
+		}
+
+		return stripped.replace(/\s+/g, " ").trim();
+	}
+
+	private extractJidUserPart(jid: string): string {
+		const [userPart = ""] = jid.split("@", 1);
+		const [baseUser = ""] = userPart.split(":", 1);
+		return baseUser;
+	}
+
+	private getGroupTriggerTokens(): string[] {
+		const aliases = this.config.groupTriggerAliases || [];
+		const deduped = new Set<string>();
+		for (const token of [this.config.botName, ...aliases]) {
+			const normalized = token.trim();
+			if (!normalized) continue;
+			deduped.add(normalized);
+		}
+		return Array.from(deduped);
 	}
 
 	private getContextInfos(message: proto.IMessage | null | undefined): Array<proto.IContextInfo | null | undefined> {
@@ -502,14 +605,33 @@ export class WhatsAppBot {
 		return all;
 	}
 
-	private isReplyToBotMessage(message: proto.IMessage | null | undefined): boolean {
+	private async isReplyToBotMessage(channelId: string, message: proto.IMessage | null | undefined): Promise<boolean> {
 		for (const info of this.getContextInfos(message)) {
 			const stanzaId = info?.stanzaId;
 			if (stanzaId && this.isRecentOutboundMessageId(stanzaId)) {
 				return true;
 			}
+
+			const participant = info?.participant;
+			if (participant && this.botJids.has(normalizeWhatsAppJid(participant))) {
+				return true;
+			}
+
+			if (stanzaId && (await this.wasBotMessageLogged(channelId, stanzaId))) {
+				return true;
+			}
 		}
 		return false;
+	}
+
+	private async wasBotMessageLogged(channelId: string, messageId: string): Promise<boolean> {
+		const cached = this.botLoggedMessageIds.get(channelId);
+		if (cached?.has(messageId)) {
+			return true;
+		}
+
+		await this.ensureBotLogCacheLoaded(channelId);
+		return this.botLoggedMessageIds.get(channelId)?.has(messageId) ?? false;
 	}
 
 	private extractText(message: proto.IMessage | null | undefined): string {
@@ -525,10 +647,26 @@ export class WhatsAppBot {
 	private timestampToMs(ts: unknown): number {
 		if (!ts) return Date.now();
 		if (typeof ts === "number") return ts * 1000;
-		if (typeof ts === "object" && ts !== null && "toNumber" in ts) {
-			const toNumber = (ts as { toNumber?: () => number }).toNumber;
-			if (typeof toNumber === "function") {
-				return toNumber() * 1000;
+		if (typeof ts === "bigint") return Number(ts) * 1000;
+		if (typeof ts === "object" && ts !== null) {
+			const stringLike = ts as { toString?: () => string };
+			if (typeof stringLike.toString === "function") {
+				const secondsFromString = Number(stringLike.toString());
+				if (Number.isFinite(secondsFromString)) {
+					return secondsFromString * 1000;
+				}
+			}
+
+			const longParts = ts as { low?: unknown; high?: unknown; unsigned?: unknown };
+			if (typeof longParts.low === "number" && typeof longParts.high === "number") {
+				const low = BigInt(longParts.low >>> 0);
+				const high = BigInt(longParts.high >>> 0);
+				const value = (high << 32n) | low;
+				const signedValue = longParts.unsigned === true ? value : BigInt.asIntN(64, value);
+				const secondsFromParts = Number(signedValue);
+				if (Number.isFinite(secondsFromParts)) {
+					return secondsFromParts * 1000;
+				}
 			}
 		}
 		return Date.now();
@@ -568,7 +706,7 @@ export class WhatsAppBot {
 			const signalRepo = this.sock.signalRepository as LIDResolver | undefined;
 			const pn = await signalRepo?.lidMapping?.getPNForLID?.(jid);
 			if (pn) {
-				const normalized = this.normalizeJid(pn);
+				const normalized = normalizeWhatsAppJid(pn);
 				this.lidToPhoneMap.set(lidUser, normalized);
 				return normalized;
 			}
@@ -577,10 +715,6 @@ export class WhatsAppBot {
 		}
 
 		return jid;
-	}
-
-	private normalizeJid(jid: string): string {
-		return `${jid.split("@")[0].split(":")[0]}@${jid.split("@")[1]?.split(":")[0] || "s.whatsapp.net"}`;
 	}
 
 	private async downloadMediaAttachments(
@@ -686,8 +820,14 @@ export class WhatsAppBot {
 		// Not reliably supported in this adapter.
 	}
 
-	logBotResponse(channel: string, text: string, ts: string): void {
-		void this.config.store.logBotResponse(channel, text, ts);
+	logBotResponse(channel: string, text: string, messageIds: string[]): void {
+		const normalizedMessageIds = Array.from(
+			new Set(messageIds.map((messageId) => messageId.trim()).filter((messageId) => messageId.length > 0)),
+		);
+		for (const messageId of normalizedMessageIds) {
+			this.rememberBotLoggedMessageId(channel, messageId);
+		}
+		void this.config.store.logBotResponse(channel, text, normalizedMessageIds);
 	}
 
 	getUser(userId: string): WhatsAppUser | undefined {

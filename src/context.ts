@@ -11,7 +11,7 @@
  */
 
 import type { UserMessage } from "@mariozechner/pi-ai";
-import type { SessionManager, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
+import type { CustomEntry, SessionManager, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 
@@ -79,6 +79,55 @@ function consumeCount(map: Map<string, number>, key: string): boolean {
 	return true;
 }
 
+interface SessionResetData {
+	at?: unknown;
+	ts?: unknown;
+}
+
+function getLatestSessionResetTimestampMs(sessionManager: SessionManager): number | null {
+	let latestTimestampMs: number | null = null;
+
+	for (const entry of sessionManager.getBranch()) {
+		if (entry.type !== "custom") continue;
+		const customEntry = entry as CustomEntry<unknown>;
+		if (customEntry.customType !== "mom.session_reset") continue;
+
+		let candidateTsMs: number | null = null;
+		const data = customEntry.data;
+		if (typeof data === "object" && data !== null) {
+			const resetData = data as SessionResetData;
+			const normalizedResetTs = normalizeMessageTimestamp(
+				typeof resetData.ts === "number" || typeof resetData.ts === "string" ? resetData.ts : undefined,
+			);
+			if (normalizedResetTs) {
+				const parsedTs = Number(normalizedResetTs);
+				if (Number.isFinite(parsedTs) && parsedTs > 0) {
+					candidateTsMs = parsedTs;
+				}
+			}
+			if (candidateTsMs === null && typeof resetData.at === "string") {
+				const parsedAt = new Date(resetData.at).getTime();
+				if (Number.isFinite(parsedAt) && parsedAt > 0) {
+					candidateTsMs = parsedAt;
+				}
+			}
+		}
+
+		if (candidateTsMs === null) {
+			const entryTs = new Date(entry.timestamp).getTime();
+			if (Number.isFinite(entryTs) && entryTs > 0) {
+				candidateTsMs = entryTs;
+			}
+		}
+
+		if (candidateTsMs !== null && (latestTimestampMs === null || candidateTsMs > latestTimestampMs)) {
+			latestTimestampMs = candidateTsMs;
+		}
+	}
+
+	return latestTimestampMs;
+}
+
 /**
  * Sync user messages from log.jsonl to SessionManager.
  *
@@ -134,6 +183,7 @@ export function syncLogToSessionManager(
 	const logContent = readFileSync(logFile, "utf-8");
 	const logLines = logContent.trim().split("\n").filter(Boolean);
 	const excludedTs = normalizeMessageTimestamp(excludeMessageTs);
+	const latestSessionResetTsMs = getLatestSessionResetTimestampMs(sessionManager);
 	const existingMessageIds = new Set<string>();
 	const syncedMessageIds = new Set<string>();
 
@@ -148,6 +198,18 @@ export function syncLogToSessionManager(
 
 			// Skip the current message being processed (will be added via prompt())
 			if (excludedTs && messageTs === excludedTs) continue;
+
+			const numericMessageTs = Number(messageTs);
+			const parsedDateTs = new Date(date).getTime();
+			const messageTsMs =
+				Number.isFinite(numericMessageTs) && numericMessageTs > 0
+					? numericMessageTs
+					: Number.isFinite(parsedDateTs) && parsedDateTs > 0
+						? parsedDateTs
+						: null;
+			if (latestSessionResetTsMs !== null && messageTsMs !== null && messageTsMs <= latestSessionResetTsMs) {
+				continue;
+			}
 
 			// Skip bot messages - added through agent flow
 			if (logMsg.isBot) continue;
@@ -167,11 +229,7 @@ export function syncLogToSessionManager(
 				continue;
 			}
 
-			const parsedMessageTs = Number(messageTs);
-			const msgTime =
-				Number.isFinite(parsedMessageTs) && parsedMessageTs > 0
-					? parsedMessageTs
-					: new Date(date).getTime() || Date.now();
+			const msgTime = messageTsMs ?? Date.now();
 			const userMessage: UserMessage = {
 				role: "user",
 				content: [{ type: "text", text: messageText }],

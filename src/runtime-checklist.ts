@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
 	type WASocket,
 } from "@whiskeysockets/baileys";
 import { createEventsWatcher } from "./events.js";
+import { createIpcWatcher, parseIpcMessage } from "./ipc.js";
 import { createExecutor, parseSandboxArg, validateSandbox } from "./sandbox.js";
 import { ChannelStore } from "./store.js";
 import { formatVerboseDetailsMessage } from "./verbose.js";
@@ -134,7 +135,7 @@ class FakeRuntimeDeps {
 				const credsPath = join(authDir, "creds.json");
 				this.authLoadHasCreds.push(existsSync(credsPath));
 				const state = {
-					creds: {},
+					creds: { registered: true },
 					keys: {
 						get: async () => ({}),
 						set: async () => undefined,
@@ -234,7 +235,7 @@ class RecordingHandler implements MomHandler {
 		}
 		if (this.autoReply) {
 			const ts = await wa.postMessage(event.channel, `ack:${event.text}`);
-			wa.logBotResponse(event.channel, `ack:${event.text}`, ts);
+			wa.logBotResponse(event.channel, `ack:${event.text}`, [ts]);
 		}
 		this.running.delete(event.channel);
 	}
@@ -842,6 +843,70 @@ async function checkEvents(): Promise<string[]> {
 	];
 }
 
+async function checkIpc(): Promise<string[]> {
+	const workspace = mkWorkspace("mom-wa-ipc");
+	const chatJid = "15550001111@s.whatsapp.net";
+	const ipcDir = join(workspace, "ipc", chatJid);
+	mkdirSync(ipcDir, { recursive: true });
+
+	const postedMessages: string[] = [];
+	const fakeWa = {
+		postMessage: async (_channel: string, text: string): Promise<string> => {
+			postedMessages.push(text);
+			return `${Date.now()}`;
+		},
+	} as unknown as WhatsAppBot;
+
+	const watcher = createIpcWatcher(workspace, fakeWa);
+	watcher.start();
+
+	const writeIpcFile = (name: string, payload: unknown): string => {
+		const timestamp = Date.now();
+		const tmpPath = join(ipcDir, `ipc-${name}-${timestamp}-abcd.tmp`);
+		const finalPath = tmpPath.replace(/\.tmp$/, ".json");
+		writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, "utf-8");
+		renameSync(tmpPath, finalPath);
+		return finalPath;
+	};
+
+	const messagePath = writeIpcFile("message", { type: "message", text: "hello from ipc" });
+	await waitFor(() => postedMessages.length === 1, 2000, "IPC message was not posted");
+	await waitFor(() => !existsSync(messagePath), 2000, "IPC message file was not deleted");
+
+	parseIpcMessage({ type: "pause_task", taskId: "task-periodic-1" });
+	parseIpcMessage({ type: "resume_task", taskId: "task-periodic-1" });
+
+	const schedulePath = writeIpcFile("schedule", {
+		type: "schedule_task",
+		task: {
+			type: "periodic",
+			text: "ping",
+			schedule: "* * * * * *",
+			timezone: "UTC",
+		},
+	});
+	await waitFor(() => !existsSync(schedulePath), 2000, "IPC schedule file was not deleted");
+
+	const eventsDir = join(workspace, "events");
+	await waitFor(() => existsSync(eventsDir), 2000, "events directory not created by IPC schedule");
+	const createdEventFile = readdirSync(eventsDir).find((filename) => filename.endsWith(".json"));
+	if (!createdEventFile) {
+		throw new Error("scheduled task file was not created");
+	}
+	const eventFileContent = readFileSync(join(eventsDir, createdEventFile), "utf-8");
+	if (!eventFileContent.includes('"type": "periodic"')) {
+		throw new Error("scheduled task file content mismatch");
+	}
+
+	watcher.stop();
+
+	return [
+		`posted messages: ${postedMessages.length}`,
+		`schedule file consumed: ${!existsSync(schedulePath)}`,
+		`events dir exists: ${existsSync(eventsDir)}`,
+	];
+}
+
 async function checkSandbox(): Promise<string[]> {
 	const container = `mom-wa-runtime-${Date.now()}`;
 
@@ -940,7 +1005,8 @@ async function main(): Promise<void> {
 	results.push(await runCheck(6, "Reconnect reliability (offline queue + flush)", checkReconnectReliability));
 	results.push(await runCheck(7, "Verbose detail toggle (MOM_WA_VERBOSE_DETAILS=0/1)", checkVerboseToggle));
 	results.push(await runCheck(8, "Events (immediate, one-shot, periodic)", checkEvents));
-	results.push(await runCheck(9, "Sandbox sanity (docker execution + persistence)", checkSandbox));
+	results.push(await runCheck(9, "IPC watcher (atomic files + schedule/message schema)", checkIpc));
+	results.push(await runCheck(10, "Sandbox sanity (docker execution + persistence)", checkSandbox));
 
 	printResults(results);
 

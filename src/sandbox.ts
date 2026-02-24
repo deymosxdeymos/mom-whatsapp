@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import { validateWorkspaceMount } from "./mount-security.js";
 
 export type SandboxConfig = { type: "host" } | { type: "docker"; container: string };
 
@@ -18,9 +19,19 @@ export function parseSandboxArg(value: string): SandboxConfig {
 	process.exit(1);
 }
 
-export async function validateSandbox(config: SandboxConfig): Promise<void> {
+export async function validateSandbox(config: SandboxConfig, workspaceDir?: string): Promise<void> {
 	if (config.type === "host") {
 		return;
+	}
+
+	if (workspaceDir) {
+		const mountValidation = validateWorkspaceMount(workspaceDir);
+		if (!mountValidation.ok) {
+			console.error(`Error [SANDBOX_MOUNT_NOT_ALLOWED]: ${mountValidation.error}`);
+			console.error(`Update allowlist: ${mountValidation.allowlistPath}`);
+			process.exit(1);
+		}
+		console.log(`  Mount allowlist matched: ${mountValidation.matchedRoot}`);
 	}
 
 	// Check if Docker is available

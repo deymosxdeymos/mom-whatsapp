@@ -7,7 +7,7 @@ A WhatsApp bot powered by pi's coding-agent runtime. It executes bash/read/write
 - WhatsApp integration (DMs + group trigger)
 - Same core agent/session architecture as `pi-mom`
 - Persistent per-chat state (`log.jsonl`, `context.jsonl`, skills, memory)
-- Event scheduler (`immediate`, `one-shot`, `periodic`)
+- Event scheduler (`immediate`, `one-shot`, `periodic`) with in-chat task management commands
 - Inbound media download to `attachments/` and prompt context handoff
 - Automatic document text extraction for common formats (`.pdf`, `.docx`, `.xlsx`, `.pptx`, text/code files)
 - Artifact URL generation for files under `artifacts/files/`
@@ -28,6 +28,8 @@ export MOM_WA_AUTH_DIR="$HOME/.pi/mom-whatsapp/wa-auth"
 export MOM_WA_BOT_NAME="mom"
 # Optional: comma-separated list of allowed group JIDs or name fragments
 export MOM_WA_ALLOWED_GROUPS="1203...@g.us,engineering"
+# Optional: extra group trigger words (comma-separated), e.g. nickname aliases
+export MOM_WA_GROUP_TRIGGER_ALIASES="jang"
 # Optional: show tool details/usage lines in chat
 export MOM_WA_VERBOSE_DETAILS=0
 # Optional: artifacts URL base (used by !artifact and auto-link on attach)
@@ -40,7 +42,8 @@ export MOM_WA_ARTIFACTS_ROOT=/path/to/data/artifacts/files
 export MOM_WA_ASSISTANT_HAS_OWN_NUMBER=1
 # Optional: model override (default: anthropic/claude-sonnet-4-6)
 export MOM_WA_MODEL=anthropic/claude-sonnet-4-6
-# Optional: fallback phone-number pairing if QR does not appear
+# Optional: phone-number pairing for auth setup
+# (used by `npm run wa:auth`, not by the runtime process)
 export MOM_WA_PAIRING_PHONE=14155551234
 
 # Option 1: Anthropic key
@@ -50,16 +53,19 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # mom-whatsapp prefers ~/.pi/agent/auth.json if present.
 # Optional fallback path: ~/.pi/mom-whatsapp/auth.json
 
+# Authenticate once (QR by default, or pairing-code if MOM_WA_PAIRING_PHONE is set)
+npm run wa:auth
+
 # Recommended: run with Docker sandbox
 mom-whatsapp --sandbox=docker:mom-sandbox ./data
 ```
 
-On first run, scan the QR code printed in the terminal.
+Runtime no longer performs QR/pairing setup. Authenticate first with `npm run wa:auth`.
 
 ## Triggering Behavior
 
 - **DMs**: always trigger the bot.
-- **Groups**: trigger when `MOM_WA_BOT_NAME` is mentioned in text (e.g. `@mom` / `mom`), directly mentioned via WhatsApp mention metadata, or when replying to a recent bot-authored message.
+- **Groups**: trigger when `MOM_WA_BOT_NAME` (or any `MOM_WA_GROUP_TRIGGER_ALIASES`) is mentioned in text, directly mentioned via WhatsApp mention metadata, when replying to a recent bot-authored message, or as a short same-user follow-up after a triggered turn.
 - **Stop override**: `stop`, `!stop`, or `/stop` cancels an active run in the same chat; in groups this works even without mention when a run is currently active.
 - **Allowlist**: if `MOM_WA_ALLOWED_GROUPS` is set, only matching groups are processed:
   - exact JID (`1203...@g.us`)
@@ -78,6 +84,17 @@ Use text commands in DM/group chats:
 - `!memory show [global|channel]` - show memory content
 - `!memory add <text>` - append to channel memory
 - `!memory add --global <text>` - append to global workspace memory
+- `!task list` - list scheduled tasks for this chat
+- `!task now <text>` - queue an immediate scheduled task message
+- `!task once <ISO-8601-with-timezone> <text>` - schedule one-shot task (example: `2026-03-01T09:00:00+07:00`)
+- `!task every <min> <hour> <dom> <mon> <dow> <text> [--tz <timezone>]` - schedule periodic task (cron)
+- `!task pause <task-id>` - pause a scheduled task
+- `!task resume <task-id>` - resume a paused task
+- `!task history <task-id> [limit]` - show recent run history for a task
+- `!task failures [limit]` - show recent failed task runs for this chat
+- `!task cancel <task-id>` - cancel a task by id (shown in `!task list`)
+- `!session status` - show context/session persistence stats for this chat
+- `!session reset` - start a fresh context while keeping historical entries on disk
 - `!artifact status` - show artifacts root + configured base URL
 - `!artifact link <path>` - generate a public URL for an artifact file/path
 - `!artifact live <path>` - same as link, with `?ws=true` for live reload
@@ -86,6 +103,21 @@ Use text commands in DM/group chats:
 
 If `MOM_WA_OWNER_JIDS` is set, privileged commands are restricted to those JIDs.
 The adapter also adds lightweight status reactions on incoming command messages: ⏳ (start), ✅ (success), ❌ (error), ⏹️ (aborted).
+
+## Agent IPC
+
+Agents can write JSON files to `<working-dir>/ipc/<chat-jid>/` to trigger host actions.
+
+Supported IPC message types:
+
+- `message`
+- `schedule_task` (`immediate`, `one-shot`, `periodic`)
+- `pause_task`
+- `resume_task`
+- `cancel_task`
+
+IPC watcher only processes files named `ipc-<type>-<timestamp>-<random>.json`.
+Write atomically (`.tmp` then rename to `.json`) to avoid partial reads.
 
 ## CLI
 
@@ -97,12 +129,20 @@ Options:
   --sandbox=docker:<container-name>
 ```
 
+Authentication helper:
+
+```bash
+npm run wa:auth                    # QR mode
+npm run wa:auth -- --pairing-code --phone 14155551234
+```
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
 | `MOM_WA_AUTH_DIR` | yes | Directory for Baileys auth/session files |
 | `MOM_WA_BOT_NAME` | no | Group trigger token (default: `mom`) |
+| `MOM_WA_GROUP_TRIGGER_ALIASES` | no | CSV extra trigger tokens for groups (e.g. `jang,bro`) |
 | `MOM_WA_ALLOWED_GROUPS` | no | CSV allowlist of group JIDs and/or group name fragments |
 | `MOM_WA_VERBOSE_DETAILS` | no | `1` to emit tool detail stream to chat, default off |
 | `MOM_WA_ARTIFACTS_BASE_URL` | no | Public base URL for artifact links (e.g. Cloudflare Tunnel URL) |
@@ -111,7 +151,7 @@ Options:
 | `MOM_WA_ASSISTANT_HAS_OWN_NUMBER` | no | `0` for shared-number setups (bot prefixes outbound text with bot name) |
 | `MOM_WA_MODEL` | no | Default model override, e.g. `anthropic/claude-sonnet-4-6` |
 | `MOM_WA_OWNER_JIDS` | no | Comma-separated owner JIDs allowed to run privileged chat commands (`!model`, `!thinking`, global memory writes) |
-| `MOM_WA_PAIRING_PHONE` | no | Optional phone-number auth fallback (digits only, e.g. `14155551234`) to print a pairing code when QR does not arrive |
+| `MOM_WA_PAIRING_PHONE` | no | Optional phone number for `npm run wa:auth` pairing-code mode (digits only, e.g. `14155551234`) |
 | `ANTHROPIC_API_KEY` | no* | API key if not using `auth.json` |
 
 ## Workspace Layout
@@ -122,6 +162,8 @@ Options:
   settings.json
   skills/
   events/
+  ipc/
+  task-runs.jsonl
   <chat-jid>/
     MEMORY.md
     log.jsonl
@@ -145,15 +187,30 @@ Options:
 
 Use Docker sandbox mode for normal operation. In host mode, commands run directly on your machine.
 
+### Docker mount allowlist
+
+When using Docker sandbox mode, mom-whatsapp validates your working directory against:
+
+- `~/.config/mom-whatsapp/mount-allowlist.json`
+
+If the file does not exist, it is created automatically with your current workspace as the initial allowed root.
+
+The allowlist supports:
+
+- `allowedRoots[]` with `path` + `allowReadWrite`
+- `blockedPatterns[]` (for sensitive paths like `.ssh`, `.aws`, etc.)
+
+If validation fails, startup exits with `SANDBOX_MOUNT_NOT_ALLOWED` and prints the allowlist path to edit.
+
 ## Troubleshooting
 
-- **QR keeps reappearing / not persisted**: verify `MOM_WA_AUTH_DIR` is stable and writable.
-- **No QR appears and you see `Connection Failure` loops**: set `MOM_WA_PAIRING_PHONE` and link via phone-number pairing code instead.
+- **QR keeps reappearing / not persisted**: run `npm run wa:auth` again and verify `MOM_WA_AUTH_DIR` is stable/writable.
+- **No QR appears / repeated `Connection Failure` during auth**: set `MOM_WA_PAIRING_PHONE` and run `npm run wa:auth` for phone-number pairing mode.
 - **No response in group**: verify bot name mention + allowlist match (`MOM_WA_ALLOWED_GROUPS`).
 - **Messages delayed after reconnect**: queued outbound messages flush automatically after connection opens.
 - **`Permission denied` when writing `/workspace/...` in Docker sandbox**: recreate sandbox container with `./docker.sh remove && ./docker.sh create ./data` (scripts use `--security-opt label=disable` for SELinux hosts).
 - **Shared-number loops**: set `MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0`.
-- **Logged out event**: restart and scan QR again.
+- **Logged out event**: run `npm run wa:auth` again, then restart `mom-whatsapp`.
 
 ## Development
 
@@ -175,6 +232,7 @@ Key files:
 - `src/whatsapp.ts` - WhatsApp transport adapter (Baileys)
 - `src/agent.ts` - agent runner/session/tool orchestration
 - `src/events.ts` - scheduled wakeups
+- `src/tasks.ts` - in-chat task CRUD over event files
 - `src/store.ts` - persistence/logging
 - `src/artifacts.ts` - artifact URL resolution
 - `src/attachment-extractor.ts` - document text extraction pipeline

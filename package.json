@@ -20,6 +20,7 @@
 		"check": "npm run typecheck",
 		"setup:hooks": "git config core.hooksPath .githooks",
 		"runtime:checklist": "tsx src/runtime-checklist.ts",
+		"wa:auth": "npm exec tsx src/whatsapp-auth.ts",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {

@@ -4,23 +4,63 @@ import { existsSync } from "fs";
 import { appendFile, readFile, writeFile } from "fs/promises";
 import { join, resolve } from "path";
 import { buildArtifactUrl, getArtifactsBaseUrl, getArtifactsRoot } from "./artifacts.js";
-import { type AgentRunner, getOrCreateRunner, translateToHostPath } from "./agent.js";
+import { type AgentRunner, getOrCreateRunner, type RunnerSessionStats, translateToHostPath } from "./agent.js";
 import { createEventsWatcher } from "./events.js";
+import { createIpcWatcher } from "./ipc.js";
+import { normalizeWhatsAppJid } from "./jid.js";
 import * as log from "./log.js";
+import {
+	createImmediateTaskEvent,
+	createOneShotTaskEvent,
+	createPeriodicTaskEvent,
+	deleteScheduledTask,
+	getDefaultTaskTimezone,
+	isValidTimezone,
+	listScheduledTasks,
+	listTaskFailures,
+	listTaskHistory,
+	pauseScheduledTask,
+	resumeScheduledTask,
+	validatePeriodicSchedule,
+} from "./tasks.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
 import { ChannelStore } from "./store.js";
 import { formatVerboseDetailsMessage } from "./verbose.js";
 import { type MomHandler, type WhatsAppBot, WhatsAppBot as WhatsAppBotClass, type WhatsAppEvent } from "./whatsapp.js";
 
+function readNumberEnv(name: string, fallback: number): number {
+	const value = process.env[name];
+	if (!value) return fallback;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 const MOM_WA_AUTH_DIR = process.env.MOM_WA_AUTH_DIR;
 const MOM_WA_BOT_NAME = process.env.MOM_WA_BOT_NAME || "mom";
 const MOM_WA_ALLOWED_GROUPS = process.env.MOM_WA_ALLOWED_GROUPS;
+const MOM_WA_GROUP_TRIGGER_ALIASES = (process.env.MOM_WA_GROUP_TRIGGER_ALIASES || "")
+	.split(",")
+	.map((value) => value.trim())
+	.filter((value) => value.length > 0);
 const MOM_WA_VERBOSE_DETAILS = process.env.MOM_WA_VERBOSE_DETAILS === "1";
 const MOM_WA_ASSISTANT_HAS_OWN_NUMBER = process.env.MOM_WA_ASSISTANT_HAS_OWN_NUMBER !== "0";
-const MOM_WA_OWNER_JIDS = (process.env.MOM_WA_OWNER_JIDS || "")
-	.split(",")
-	.map((v) => v.trim().toLowerCase())
-	.filter(Boolean);
+const MOM_WA_RUN_TIMEOUT_MS = Number(process.env.MOM_WA_RUN_TIMEOUT_MS) || 10 * 60 * 1000; // 10 min default
+const MOM_WA_BUBBLE_DELAY_ENABLED = process.env.MOM_WA_BUBBLE_DELAY !== "0";
+const MOM_WA_BUBBLE_DELAY_PER_CHAR_MS = Math.max(0, readNumberEnv("MOM_WA_BUBBLE_DELAY_PER_CHAR_MS", 10));
+const MOM_WA_BUBBLE_DELAY_MIN_MS = Math.max(0, readNumberEnv("MOM_WA_BUBBLE_DELAY_MIN_MS", 80));
+const MOM_WA_BUBBLE_DELAY_MAX_MS = Math.max(
+	MOM_WA_BUBBLE_DELAY_MIN_MS,
+	readNumberEnv("MOM_WA_BUBBLE_DELAY_MAX_MS", 600),
+);
+
+const RUN_MAX_RETRIES = 3;
+const RUN_BASE_RETRY_MS = 5000; // 5s → 10s → 20s
+const MOM_WA_OWNER_JIDS = new Set(
+	(process.env.MOM_WA_OWNER_JIDS || "")
+		.split(",")
+		.map((value) => normalizeWhatsAppJid(value))
+		.filter((value) => value.length > 0),
+);
 
 interface ParsedArgs {
 	workingDir?: string;
@@ -60,7 +100,7 @@ if (!MOM_WA_AUTH_DIR) {
 }
 
 const { workingDir, sandbox } = { workingDir: parsedArgs.workingDir, sandbox: parsedArgs.sandbox };
-await validateSandbox(sandbox);
+await validateSandbox(sandbox, workingDir);
 
 interface ChannelState {
 	running: boolean;
@@ -103,13 +143,169 @@ function parseCommand(text: string): { name: string; args: string[] } | null {
 	return { name: parts[0].toLowerCase(), args: parts.slice(1) };
 }
 
-function normalizeJid(jid: string): string {
-	return jid.trim().toLowerCase();
+function isOwnerJid(jid: string): boolean {
+	if (MOM_WA_OWNER_JIDS.size === 0) return true;
+	return MOM_WA_OWNER_JIDS.has(normalizeWhatsAppJid(jid));
 }
 
-function isOwnerJid(jid: string): boolean {
-	if (MOM_WA_OWNER_JIDS.length === 0) return true;
-	return MOM_WA_OWNER_JIDS.includes(normalizeJid(jid));
+function truncateText(text: string, maxLen: number): string {
+	if (text.length <= maxLen) return text;
+	return `${text.slice(0, maxLen - 3)}...`;
+}
+
+// Split a response into chat bubbles.
+// Primary: \n---\n explicit separator the model is instructed to use.
+// Fallback: \n\n paragraph breaks — catches cases where the model uses
+// natural paragraphs instead of the explicit separator.
+function splitIntoBubbles(text: string): string[] {
+	// First split on explicit --- separator
+	const explicitBubbles = text
+		.split(/\n[ \t]*---[ \t]*\n/)
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+
+	// If the model used ---, honour those splits only
+	if (explicitBubbles.length > 1) return explicitBubbles;
+
+	// Otherwise fall back to paragraph breaks (\n\n)
+	return text
+		.split(/\n\n+/)
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+}
+
+// Compute a realistic typing delay before sending a bubble (simulates human typing).
+function typingDelayMs(text: string): number {
+	if (!MOM_WA_BUBBLE_DELAY_ENABLED) {
+		return 0;
+	}
+	const ms = text.length * MOM_WA_BUBBLE_DELAY_PER_CHAR_MS;
+	return Math.min(Math.max(ms, MOM_WA_BUBBLE_DELAY_MIN_MS), MOM_WA_BUBBLE_DELAY_MAX_MS);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function awaitRunTermination(
+	channelId: string,
+	runPromise: Promise<{ stopReason: string; errorMessage?: string }>,
+	maxWaitMs = 5000,
+): Promise<void> {
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const termination = await Promise.race([
+			runPromise,
+			new Promise<"timed_out">((resolve) => {
+				timeoutHandle = setTimeout(() => resolve("timed_out"), maxWaitMs);
+			}),
+		]);
+
+		if (termination === "timed_out") {
+			log.logWarning(`[${channelId}] Run did not terminate within ${maxWaitMs}ms after abort`);
+		}
+	} catch (err) {
+		log.logWarning(
+			`[${channelId}] Run terminated with error after abort`,
+			err instanceof Error ? err.message : String(err),
+		);
+	} finally {
+		clearTimeout(timeoutHandle);
+	}
+}
+
+function isRateLimitErrorText(text: string | undefined): boolean {
+	if (!text) return false;
+	const normalized = text.toLowerCase();
+	return normalized.includes("rate_limit") || normalized.includes("rate limit") || normalized.includes("429");
+}
+
+function formatSessionStatus(stats: RunnerSessionStats): string {
+	return [
+		"*Session status*",
+		"Context file: hidden",
+		`Context file exists: ${stats.contextFileExists ? "yes" : "no"}`,
+		`Context file size: ${stats.contextFileSizeBytes} bytes`,
+		`Context file modified: ${stats.contextFileLastModifiedIso || "(n/a)"}`,
+		`Total entries: ${stats.totalEntries}`,
+		`Context messages: ${stats.contextMessageCount}`,
+	].join("\n");
+}
+
+function formatProvidersList(available: Array<{ provider: string; models: string[] }>): string {
+	if (available.length === 0) {
+		return "No providers with available API keys found.";
+	}
+
+	const lines: string[] = ["*Available providers & models*"];
+	for (const entry of available) {
+		lines.push(`${entry.provider} (${entry.models.length})`);
+		for (const modelId of entry.models) {
+			lines.push(`- ${entry.provider}/${modelId}`);
+		}
+		lines.push("");
+	}
+
+	if (lines[lines.length - 1] === "") {
+		lines.pop();
+	}
+
+	return lines.join("\n");
+}
+
+function formatTaskHelp(defaultTimezone: string): string {
+	return [
+		"*Task commands*",
+		"!task list",
+		"!task now <text>  # owner",
+		"!task once <ISO-8601-with-timezone> <text>  # owner",
+		"!task every <min> <hour> <dom> <mon> <dow> <text>  # owner",
+		"!task every <min> <hour> <dom> <mon> <dow> <text> --tz <IANA timezone>  # owner",
+		"!task pause <task-id>  # owner",
+		"!task resume <task-id>  # owner",
+		"!task history <task-id> [limit]",
+		"!task failures [limit]",
+		"!task cancel <task-id>  # owner",
+		`Default timezone: ${defaultTimezone}`,
+	].join("\n");
+}
+
+interface ParsedPeriodicTaskArgs {
+	schedule: string;
+	timezone: string;
+	text: string;
+}
+
+function parsePeriodicTaskArgs(args: string[]): { ok: true; value: ParsedPeriodicTaskArgs } | { ok: false; error: string } {
+	if (args.length < 6) {
+		return { ok: false, error: "Usage: !task every <min> <hour> <dom> <mon> <dow> <text> [--tz <timezone>]" };
+	}
+
+	const schedule = args.slice(0, 5).join(" ");
+	const rest = args.slice(5);
+	let timezone = getDefaultTaskTimezone();
+	const textParts: string[] = [];
+
+	for (let i = 0; i < rest.length; i += 1) {
+		const part = rest[i];
+		if (part === "--tz") {
+			const next = rest[i + 1];
+			if (!next) {
+				return { ok: false, error: "Missing timezone after --tz" };
+			}
+			timezone = next;
+			i += 1;
+			continue;
+		}
+		textParts.push(part);
+	}
+
+	const text = textParts.join(" ").trim();
+	if (!text) {
+		return { ok: false, error: "Task text is required." };
+	}
+
+	return { ok: true, value: { schedule, timezone, text } };
 }
 
 function formatHelp(): string {
@@ -118,6 +314,7 @@ function formatHelp(): string {
 		"!help",
 		"!stop                       # stop active run in this chat",
 		"!status",
+		"!providers                  # list providers and available models",
 		"!model                       # show current model",
 		"!model <provider/model>      # set model (owner)",
 		"!thinking                    # show thinking level",
@@ -125,6 +322,17 @@ function formatHelp(): string {
 		"!memory show [global|channel]",
 		"!memory add <text>",
 		"!memory add --global <text>  # owner",
+		"!task list",
+		"!task now <text>                # owner",
+		"!task once <ISO time> <text>    # owner",
+		"!task every <min> <hour> <dom> <mon> <dow> <text> [--tz timezone]  # owner",
+		"!task pause <task-id>           # owner",
+		"!task resume <task-id>          # owner",
+		"!task history <task-id> [limit]",
+		"!task failures [limit]",
+		"!task cancel <task-id>          # owner",
+		"!session status",
+		"!session reset                 # owner",
 		"!artifact status",
 		"!artifact link <path>",
 		"!artifact live <path>        # add ?ws=true",
@@ -143,7 +351,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 	if (command.name === "status") {
 		const model = state.runner.getModel();
 		const thinking = state.runner.getThinkingLevel();
-		const ownerScoped = MOM_WA_OWNER_JIDS.length > 0;
+		const ownerScoped = MOM_WA_OWNER_JIDS.size > 0;
 		const artifactBaseUrl = await getArtifactsBaseUrl();
 		const status = [
 			"*Mom status*",
@@ -154,9 +362,19 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			`Verbose details: ${MOM_WA_VERBOSE_DETAILS ? "on" : "off"}`,
 			`Queued outbound: ${wa.getOutgoingQueueSize()}`,
 			`Artifacts URL: ${artifactBaseUrl || "(not configured)"}`,
-			ownerScoped ? `Owner controls: enabled (${MOM_WA_OWNER_JIDS.length} jid)` : "Owner controls: disabled",
+			ownerScoped ? `Owner controls: enabled (${MOM_WA_OWNER_JIDS.size} jid)` : "Owner controls: disabled",
 		].join("\n");
 		await wa.postMessage(event.channel, status);
+		return true;
+	}
+
+	if (command.name === "providers" || command.name === "models") {
+		try {
+			const available = await state.runner.getAvailableProviderModels();
+			await wa.postMessage(event.channel, formatProvidersList(available));
+		} catch (err) {
+			await wa.postMessage(event.channel, `_Failed to list providers:_ ${err instanceof Error ? err.message : String(err)}`);
+		}
 		return true;
 	}
 
@@ -259,6 +477,286 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 		return true;
 	}
 
+	if (command.name === "task" || command.name === "tasks") {
+		const sub = command.args[0]?.toLowerCase() || "help";
+		const defaultTimezone = getDefaultTaskTimezone();
+
+		if (sub === "help") {
+			await wa.postMessage(event.channel, formatTaskHelp(defaultTimezone));
+			return true;
+		}
+
+		if (sub === "list") {
+			const tasks = await listScheduledTasks(workingDir, event.channel);
+			if (tasks.length === 0) {
+				await wa.postMessage(event.channel, "No scheduled tasks for this chat.");
+				return true;
+			}
+
+			const lines: string[] = ["*Scheduled tasks*", `Count: ${tasks.length}`];
+			for (const task of tasks) {
+				const runInfo =
+					task.lastRunAtIso === null
+						? "last: never"
+						: `last: ${task.lastRunAtIso} (${task.lastRunStatus || "unknown"})`;
+
+				if (task.event.type === "immediate") {
+					lines.push(`- ${task.id} | immediate | ${task.status} | ${runInfo}`);
+					lines.push(`  ${truncateText(task.event.text, 120)}`);
+					continue;
+				}
+
+				if (task.event.type === "one-shot") {
+					lines.push(
+						`- ${task.id} | once | ${task.status} | at: ${task.event.at} | runs: ${task.runCount} | ${runInfo}`,
+					);
+					if (task.lastRunError) {
+						lines.push(`  error: ${truncateText(task.lastRunError, 80)}`);
+					}
+					lines.push(`  ${truncateText(task.event.text, 120)}`);
+					continue;
+				}
+
+				lines.push(
+					`- ${task.id} | periodic | ${task.status} | ${task.event.schedule} | ${task.event.timezone} | next: ${task.nextRunIso || "unknown"} | runs: ${task.runCount} | ${runInfo}`,
+				);
+				if (task.lastRunError) {
+					lines.push(`  error: ${truncateText(task.lastRunError, 80)}`);
+				}
+				lines.push(`  ${truncateText(task.event.text, 120)}`);
+			}
+			await wa.postMessage(event.channel, lines.join("\n"));
+			return true;
+		}
+
+		if (sub === "now") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can create tasks._");
+				return true;
+			}
+			const text = command.args.slice(1).join(" ").trim();
+			if (!text) {
+				await wa.postMessage(event.channel, "_Usage: !task now <text>_");
+				return true;
+			}
+			const created = await createImmediateTaskEvent(workingDir, event.channel, text);
+			await wa.postMessage(event.channel, `Task queued: ${created.id}`);
+			return true;
+		}
+
+		if (sub === "once") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can create tasks._");
+				return true;
+			}
+			if (command.args.length < 3) {
+				await wa.postMessage(event.channel, "_Usage: !task once <ISO-8601-with-timezone> <text>_");
+				return true;
+			}
+			const at = command.args[1];
+			const text = command.args.slice(2).join(" ").trim();
+			if (!/(Z|[+-]\d{2}:\d{2})$/i.test(at)) {
+				await wa.postMessage(event.channel, "_Timestamp must include timezone offset (e.g. +01:00 or Z)._");
+				return true;
+			}
+			const atTime = new Date(at).getTime();
+			if (!Number.isFinite(atTime)) {
+				await wa.postMessage(event.channel, "_Invalid timestamp. Use ISO-8601 format._");
+				return true;
+			}
+			if (atTime <= Date.now()) {
+				await wa.postMessage(event.channel, "_Timestamp must be in the future._");
+				return true;
+			}
+			if (!text) {
+				await wa.postMessage(event.channel, "_Task text is required._");
+				return true;
+			}
+			const created = await createOneShotTaskEvent(workingDir, event.channel, text, at);
+			await wa.postMessage(event.channel, `One-shot task created: ${created.id}\nRuns at: ${at}`);
+			return true;
+		}
+
+		if (sub === "every") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can create tasks._");
+				return true;
+			}
+			const parsed = parsePeriodicTaskArgs(command.args.slice(1));
+			if (!parsed.ok) {
+				await wa.postMessage(event.channel, `_` + parsed.error + `_`);
+				return true;
+			}
+
+			if (!isValidTimezone(parsed.value.timezone)) {
+				await wa.postMessage(event.channel, `_Invalid timezone: ${parsed.value.timezone}_`);
+				return true;
+			}
+
+			const validation = validatePeriodicSchedule(parsed.value.schedule, parsed.value.timezone);
+			if (!validation.ok) {
+				await wa.postMessage(event.channel, `_Invalid cron schedule: ${validation.error || "unknown error"}_`);
+				return true;
+			}
+
+			const created = await createPeriodicTaskEvent(
+				workingDir,
+				event.channel,
+				parsed.value.text,
+				parsed.value.schedule,
+				parsed.value.timezone,
+			);
+			await wa.postMessage(
+				event.channel,
+				[
+					`Periodic task created: ${created.id}`,
+					`Schedule: ${parsed.value.schedule}`,
+					`Timezone: ${parsed.value.timezone}`,
+					`Next run: ${validation.nextRunIso || "unknown"}`,
+				].join("\n"),
+			);
+			return true;
+		}
+
+		if (sub === "pause") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can pause tasks._");
+				return true;
+			}
+			const identifier = command.args[1]?.trim();
+			if (!identifier) {
+				await wa.postMessage(event.channel, "_Usage: !task pause <task-id>_");
+				return true;
+			}
+			const result = await pauseScheduledTask(workingDir, event.channel, identifier);
+			if (!result.ok) {
+				await wa.postMessage(event.channel, `_Failed to pause task:_ ${result.error}`);
+				return true;
+			}
+			await wa.postMessage(event.channel, `Task paused: ${result.filename.replace(/\.json$/i, "")}`);
+			return true;
+		}
+
+		if (sub === "resume") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can resume tasks._");
+				return true;
+			}
+			const identifier = command.args[1]?.trim();
+			if (!identifier) {
+				await wa.postMessage(event.channel, "_Usage: !task resume <task-id>_");
+				return true;
+			}
+			const result = await resumeScheduledTask(workingDir, event.channel, identifier);
+			if (!result.ok) {
+				await wa.postMessage(event.channel, `_Failed to resume task:_ ${result.error}`);
+				return true;
+			}
+			await wa.postMessage(event.channel, `Task resumed: ${result.filename.replace(/\.json$/i, "")}`);
+			return true;
+		}
+
+		if (sub === "history") {
+			const identifier = command.args[1]?.trim();
+			if (!identifier) {
+				await wa.postMessage(event.channel, "_Usage: !task history <task-id> [limit]_");
+				return true;
+			}
+
+			const parsedLimit = command.args[2] ? Number(command.args[2]) : 10;
+			const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : 10;
+			const history = await listTaskHistory(workingDir, event.channel, identifier, limit);
+			if (!history.ok) {
+				await wa.postMessage(event.channel, `_Failed to read task history:_ ${history.error}`);
+				return true;
+			}
+			if (history.records.length === 0) {
+				await wa.postMessage(event.channel, `No run history for task: ${history.taskId}`);
+				return true;
+			}
+
+			const lines: string[] = [
+				`*Task history*`,
+				`Task: ${history.taskId}`,
+				`Entries: ${history.records.length}`,
+			];
+			for (const record of history.records) {
+				const durationSec = (record.durationMs / 1000).toFixed(2);
+				lines.push(`- ${record.runAtIso} | ${record.status} | ${durationSec}s`);
+				if (record.error) {
+					lines.push(`  ${truncateText(record.error, 120)}`);
+				}
+			}
+			await wa.postMessage(event.channel, lines.join("\n"));
+			return true;
+		}
+
+		if (sub === "failures") {
+			const parsedLimit = command.args[1] ? Number(command.args[1]) : 10;
+			const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : 10;
+			const failures = await listTaskFailures(workingDir, event.channel, limit);
+			if (failures.length === 0) {
+				await wa.postMessage(event.channel, "No task failures recorded for this chat.");
+				return true;
+			}
+
+			const lines: string[] = ["*Task failures*", `Entries: ${failures.length}`];
+			for (const failure of failures) {
+				const durationSec = (failure.durationMs / 1000).toFixed(2);
+				lines.push(`- ${failure.taskId} | ${failure.runAtIso} | ${durationSec}s`);
+				if (failure.error) {
+					lines.push(`  ${truncateText(failure.error, 120)}`);
+				}
+			}
+			await wa.postMessage(event.channel, lines.join("\n"));
+			return true;
+		}
+
+		if (sub === "cancel" || sub === "delete" || sub === "rm") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can cancel tasks._");
+				return true;
+			}
+			const identifier = command.args[1]?.trim();
+			if (!identifier) {
+				await wa.postMessage(event.channel, "_Usage: !task cancel <task-id>_");
+				return true;
+			}
+			const result = await deleteScheduledTask(workingDir, event.channel, identifier);
+			if (!result.ok) {
+				await wa.postMessage(event.channel, `_Failed to cancel task:_ ${result.error}`);
+				return true;
+			}
+			await wa.postMessage(event.channel, `Task cancelled: ${result.filename.replace(/\.json$/i, "")}`);
+			return true;
+		}
+
+		await wa.postMessage(event.channel, formatTaskHelp(defaultTimezone));
+		return true;
+	}
+
+	if (command.name === "session") {
+		const sub = command.args[0]?.toLowerCase() || "status";
+		if (sub === "status") {
+			await wa.postMessage(event.channel, formatSessionStatus(state.runner.getSessionStats()));
+			return true;
+		}
+		if (sub === "reset") {
+			if (!isOwnerJid(event.user)) {
+				await wa.postMessage(event.channel, "_Only configured owner JIDs can reset session context._");
+				return true;
+			}
+			const result = state.runner.resetSession();
+			await wa.postMessage(
+				event.channel,
+				`Session reset. Previous entry count: ${result.previousEntryCount}. Next messages start a fresh context.`,
+			);
+			return true;
+		}
+		await wa.postMessage(event.channel, "_Usage: !session status | !session reset_");
+		return true;
+	}
+
 	if (command.name === "artifact" || command.name === "artifacts") {
 		const sub = command.args[0]?.toLowerCase() || "status";
 		if (sub === "status") {
@@ -319,10 +817,41 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 	return true;
 }
 
-function createWhatsAppContext(event: WhatsAppEvent, wa: WhatsAppBot, state: ChannelState) {
+function createWhatsAppContext(
+	event: WhatsAppEvent,
+	wa: WhatsAppBot,
+	state: ChannelState,
+	hooks?: { onOutput?: () => void; onToolExecution?: () => void },
+) {
 	const user = wa.getUser(event.user);
 	let lastMessageTs: string | null = null;
-	let lastMainMessageText: string | null = null;
+	// Track the full logical text last sent to detect duplicates across bubble splits.
+	// Only updated when shouldLog=true (real responses, not tool progress labels).
+	let logicalLastSentText: string | null = null;
+
+	// Send text as one or more chat bubbles, with a realistic typing delay between them.
+	// The model uses \n---\n as a separator to mark natural bubble boundaries.
+	const sendBubbles = async (text: string, shouldLog: boolean): Promise<void> => {
+		const bubbles = splitIntoBubbles(text);
+		const sentMessageIds: string[] = [];
+		for (let i = 0; i < bubbles.length; i++) {
+			if (i > 0) {
+				const delayMs = typingDelayMs(bubbles[i - 1]);
+				if (delayMs > 0) {
+					await wa.setTyping(event.channel, true);
+					await sleep(delayMs);
+				}
+			}
+			const sentMessageId = await wa.postMessage(event.channel, bubbles[i]);
+			lastMessageTs = sentMessageId;
+			sentMessageIds.push(sentMessageId);
+		}
+		if (shouldLog && sentMessageIds.length > 0) {
+			wa.logBotResponse(event.channel, text, sentMessageIds);
+			logicalLastSentText = text;
+			hooks?.onOutput?.();
+		}
+	};
 
 	return {
 		message: {
@@ -340,18 +869,25 @@ function createWhatsAppContext(event: WhatsAppEvent, wa: WhatsAppBot, state: Cha
 		users: wa.getAllUsers().map((u) => ({ id: u.id, userName: u.userName, displayName: u.displayName })),
 
 		respond: async (text: string, shouldLog = true) => {
-			lastMessageTs = await wa.postMessage(event.channel, text);
-			lastMainMessageText = text;
-			if (shouldLog) {
-				wa.logBotResponse(event.channel, text, lastMessageTs);
-			}
+			await sendBubbles(text, shouldLog);
 		},
 
 		replaceMessage: async (text: string) => {
-			// WhatsApp doesn't support message updates; avoid duplicating the final reply.
-			if (lastMainMessageText === text) return;
-			lastMessageTs = await wa.postMessage(event.channel, text);
-			lastMainMessageText = text;
+			// WhatsApp doesn't support message edits. Skip if the logical content was
+			// already sent (e.g. agent's message_end already delivered all bubbles).
+			if (logicalLastSentText === text) return;
+			const bubbles = splitIntoBubbles(text);
+			for (let i = 0; i < bubbles.length; i++) {
+				if (i > 0) {
+					const delayMs = typingDelayMs(bubbles[i - 1]);
+					if (delayMs > 0) {
+						await wa.setTyping(event.channel, true);
+						await sleep(delayMs);
+					}
+				}
+				lastMessageTs = await wa.postMessage(event.channel, bubbles[i]);
+			}
+			logicalLastSentText = text;
 		},
 
 		respondInThread: async (text: string) => {
@@ -377,6 +913,10 @@ function createWhatsAppContext(event: WhatsAppEvent, wa: WhatsAppBot, state: Cha
 				await wa.deleteMessage(event.channel, lastMessageTs);
 			}
 			log.logInfo(`deleteMessage requested but WhatsApp delete is a no-op (${event.channel})`);
+		},
+
+		markToolExecution: () => {
+			hooks?.onToolExecution?.();
 		},
 	};
 }
@@ -412,39 +952,159 @@ const handler: MomHandler = {
 
 		state.running = true;
 		state.stopRequested = false;
-		let ctx: ReturnType<typeof createWhatsAppContext> | undefined;
 
 		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
 
-		try {
-			await react("⏳");
-			ctx = createWhatsAppContext(event, wa, state);
-			await ctx.setTyping(true);
-			await ctx.setWorking(true);
-			const result = await state.runner.run(ctx, state.store);
+		await react("⏳");
 
-			if (result.stopReason === "aborted" && state.stopRequested) {
-				await wa.postMessage(event.channel, "_Stopped_");
-				await react("⏹️");
-			} else {
-				await react("✅");
+		const retryCheckpoint = state.runner.createCheckpoint();
+		const rollbackBeforeRetry = (): boolean => {
+			try {
+				state.runner.restoreCheckpoint(retryCheckpoint);
+				return true;
+			} catch (err) {
+				log.logWarning(
+					`[${event.channel}] Failed to restore runner state before retry`,
+					err instanceof Error ? err.message : String(err),
+				);
+				return false;
 			}
-		} catch (err) {
-			await react("❌");
-			log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
-		} finally {
-			if (ctx) {
+		};
+
+		let attempt = 0;
+		while (attempt < RUN_MAX_RETRIES) {
+			attempt++;
+			let ctx: ReturnType<typeof createWhatsAppContext> | undefined;
+			let outputSentToUser = false;
+			let hadToolExecution = false;
+			let timedOut = false;
+			let runPromise: Promise<{ stopReason: string; errorMessage?: string }> | null = null;
+
+			try {
+				ctx = createWhatsAppContext(event, wa, state, {
+					onOutput: () => {
+						outputSentToUser = true;
+					},
+					onToolExecution: () => {
+						hadToolExecution = true;
+					},
+				});
+				await ctx.setTyping(true);
+				await ctx.setWorking(true);
+
+				// Race the run against a hard timeout — prevents the bot getting stuck forever.
+				let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+				runPromise = state.runner.run(ctx, state.store);
+				const timeoutPromise = new Promise<never>((_, reject) => {
+					timeoutHandle = setTimeout(() => {
+						timedOut = true;
+						state.runner.abort();
+						reject(new Error(`timed out after ${MOM_WA_RUN_TIMEOUT_MS / 1000}s`));
+					}, MOM_WA_RUN_TIMEOUT_MS);
+				});
+
+				let result: { stopReason: string; errorMessage?: string };
 				try {
-					await ctx.setWorking(false);
-				} catch (err) {
-					log.logWarning(
-						`[${event.channel}] Failed to clear typing state`,
-						err instanceof Error ? err.message : String(err),
-					);
+					result = await Promise.race([runPromise, timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+
+				if (timedOut) {
+					log.logWarning(`[${event.channel}] Run timed out (attempt ${attempt})`);
+					if (!outputSentToUser) {
+						await wa.postMessage(event.channel, "took too long, try again");
+					}
+					await react("❌");
+					break;
+				}
+
+				if (result.stopReason === "aborted" && state.stopRequested) {
+					await wa.postMessage(event.channel, "stopped");
+					await react("⏹️");
+					break;
+				}
+
+				if (result.stopReason === "error") {
+					const isRateLimit = isRateLimitErrorText(result.errorMessage);
+					// Retry only before user-visible output and before any tool execution.
+					// This avoids re-running non-idempotent tool actions after partial progress.
+					if (!outputSentToUser && !hadToolExecution && !state.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
+						if (!rollbackBeforeRetry()) {
+							if (!outputSentToUser && !state.stopRequested) {
+								await wa.postMessage(event.channel, "something went wrong, try again");
+							}
+							await react("❌");
+							break;
+						}
+						const delayMs = RUN_BASE_RETRY_MS * Math.pow(2, attempt - 1);
+						log.logWarning(
+							`[${event.channel}] Run failed (attempt ${attempt}/${RUN_MAX_RETRIES}), retrying in ${delayMs}ms`,
+						);
+						await sleep(delayMs);
+						continue;
+					}
+					if (!outputSentToUser && !state.stopRequested) {
+						await wa.postMessage(event.channel, isRateLimit ? "api lagi padat, coba lagi bentar" : "something went wrong, try again");
+					}
+					await react("❌");
+					break;
+				}
+
+				await react("✅");
+				break;
+			} catch (err) {
+				const errMsg = err instanceof Error ? err.message : String(err);
+
+				if (timedOut) {
+					if (runPromise) {
+						await awaitRunTermination(event.channel, runPromise);
+					}
+					log.logWarning(`[${event.channel}] Run timed out (attempt ${attempt})`);
+					if (!outputSentToUser) {
+						await wa.postMessage(event.channel, "took too long, try again");
+					}
+					await react("❌");
+					break;
+				}
+
+				log.logWarning(`[${event.channel}] Run error (attempt ${attempt}/${RUN_MAX_RETRIES})`, errMsg);
+				const isRateLimit = isRateLimitErrorText(errMsg);
+
+				if (!outputSentToUser && !hadToolExecution && !state.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
+					if (!rollbackBeforeRetry()) {
+						if (!outputSentToUser && !state.stopRequested) {
+							await wa.postMessage(event.channel, "something went wrong, try again");
+						}
+						await react("❌");
+						break;
+					}
+					const delayMs = RUN_BASE_RETRY_MS * Math.pow(2, attempt - 1);
+					log.logWarning(`[${event.channel}] Retrying in ${delayMs}ms`);
+					await sleep(delayMs);
+					continue;
+				}
+
+				if (!outputSentToUser) {
+					await wa.postMessage(event.channel, isRateLimit ? "api lagi padat, coba lagi bentar" : "something went wrong, try again");
+				}
+				await react("❌");
+				break;
+			} finally {
+				if (ctx) {
+					try {
+						await ctx.setWorking(false);
+					} catch (err) {
+						log.logWarning(
+							`[${event.channel}] Failed to clear typing state`,
+							err instanceof Error ? err.message : String(err),
+						);
+					}
 				}
 			}
-			state.running = false;
 		}
+
+		state.running = false;
 	},
 };
 
@@ -463,21 +1123,28 @@ const bot = new WhatsAppBotClass(handler, {
 				.filter(Boolean)
 		: [],
 	assistantHasOwnNumber: MOM_WA_ASSISTANT_HAS_OWN_NUMBER,
+	groupTriggerAliases: MOM_WA_GROUP_TRIGGER_ALIASES,
 });
 
 const eventsWatcher = createEventsWatcher(workingDir, bot);
 eventsWatcher.start();
 
-process.on("SIGINT", () => {
+const ipcWatcher = createIpcWatcher(workingDir, bot);
+ipcWatcher.start();
+
+function shutdown(): void {
 	log.logInfo("Shutting down...");
 	eventsWatcher.stop();
+	ipcWatcher.stop();
 	process.exit(0);
-});
+}
 
-process.on("SIGTERM", () => {
-	log.logInfo("Shutting down...");
-	eventsWatcher.stop();
-	process.exit(0);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
-await bot.start();
+try {
+	await bot.start();
+} catch (err) {
+	log.logWarning("Failed to start WhatsApp bot", err instanceof Error ? err.message : String(err));
+	process.exit(1);
+}
