@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 CONTAINER_NAME="mom-whatsapp-sandbox"
-IMAGE="alpine:latest"
+IMAGE="debian:bookworm-slim"
 
 case "$1" in
   create)
@@ -34,8 +34,8 @@ case "$1" in
       tail -f /dev/null
 
     if [ $? -eq 0 ]; then
-      echo "Installing runtime dependencies (unzip, poppler-utils)..."
-      if ! docker exec "$CONTAINER_NAME" /bin/sh -lc "apk add --no-cache unzip poppler-utils >/dev/null"; then
+      echo "Installing runtime dependencies (node, uv, unzip, poppler-utils)..."
+      if ! docker exec "$CONTAINER_NAME" /bin/sh -lc "set -e; apt-get update >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nodejs npm python3 python3-venv unzip poppler-utils >/dev/null; curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null; ln -sf /root/.local/bin/uv /usr/local/bin/uv; ln -sf /root/.local/bin/uvx /usr/local/bin/uvx"; then
         echo "Failed to install runtime dependencies inside container."
         echo "Removing incomplete container '${CONTAINER_NAME}'..."
         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1

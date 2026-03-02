@@ -548,6 +548,94 @@ async function checkGroupTriggers(): Promise<string[]> {
 	];
 }
 
+async function checkGroupPendingHistory(): Promise<string[]> {
+	const workspace = mkWorkspace("mom-wa-group-history");
+	const authDir = join(workspace, "auth");
+	const groupJid = "120300000004@g.us";
+
+	const store = new ChannelStore({ workingDir: workspace });
+	const depsRuntime = new FakeRuntimeDeps();
+	depsRuntime.enqueueSocket(
+		new FakeSocket({
+			botJid: "19999999999@s.whatsapp.net",
+			autoOpen: true,
+			groups: {
+				[groupJid]: { subject: "History Test" },
+			},
+		}),
+	);
+	const handler = new RecordingHandler(false);
+
+	const bot = new WhatsAppBot(handler, {
+		authDir,
+		workingDir: workspace,
+		store,
+		botName: "mom",
+		allowedGroups: [groupJid],
+		assistantHasOwnNumber: true,
+		deps: depsRuntime.createDeps(),
+	});
+	await bot.start();
+	await sleep(30);
+
+	const socket = depsRuntime.createdSockets[0];
+	socket.emitMessages([
+		groupMessage({
+			id: "grp-hist-1",
+			channel: groupJid,
+			sender: "15550006666@s.whatsapp.net",
+			text: "we should ship the settings fix first",
+			timestampSec: Math.floor((Date.now() + 2000) / 1000),
+		}),
+		groupMessage({
+			id: "grp-hist-2",
+			channel: groupJid,
+			sender: "15550007777@s.whatsapp.net",
+			text: "yeah and the migration is still risky",
+			timestampSec: Math.floor((Date.now() + 3000) / 1000),
+		}),
+	]);
+
+	await sleep(100);
+	if (handler.events.length !== 0) {
+		throw new Error(`Expected no triggered events before mention, got ${handler.events.length}`);
+	}
+
+	socket.emitMessages([
+		groupMessage({
+			id: "grp-hist-3",
+			channel: groupJid,
+			sender: "15550008888@s.whatsapp.net",
+			text: "@mom wdyt",
+			mentionBotJid: "19999999999@s.whatsapp.net",
+			timestampSec: Math.floor((Date.now() + 4000) / 1000),
+		}),
+	]);
+
+	await waitFor(() => handler.events.length === 1, 1000, "Expected exactly 1 triggered group event");
+	const event = handler.events[0];
+	const pendingHistory = event.pendingHistory ?? [];
+	if (pendingHistory.length !== 2) {
+		throw new Error(`Expected 2 pending history entries, got ${pendingHistory.length}`);
+	}
+	if (pendingHistory[0]?.text !== "we should ship the settings fix first") {
+		throw new Error(`Unexpected first history entry: ${pendingHistory[0]?.text ?? "(missing)"}`);
+	}
+	if (pendingHistory[1]?.text !== "yeah and the migration is still risky") {
+		throw new Error(`Unexpected second history entry: ${pendingHistory[1]?.text ?? "(missing)"}`);
+	}
+	if (event.text !== "wdyt") {
+		throw new Error(`Expected cleaned trigger text 'wdyt', got ${event.text}`);
+	}
+
+	return [
+		`triggered channel: ${event.channel}`,
+		`pending history count: ${pendingHistory.length}`,
+		`pending history sample: ${pendingHistory.map((entry) => entry.text).join(" | ")}`,
+		`trigger text: ${event.text}`,
+	];
+}
+
 async function checkSharedNumberMode(): Promise<string[]> {
 	const workspace = mkWorkspace("mom-wa-shared");
 	const authDir = join(workspace, "auth");
@@ -914,13 +1002,28 @@ async function checkSandbox(): Promise<string[]> {
 	try {
 		const create = spawnSync(
 			"docker",
-			["run", "-d", "--name", container, "alpine:latest", "tail", "-f", "/dev/null"],
+			["run", "-d", "--name", container, "debian:bookworm-slim", "tail", "-f", "/dev/null"],
 			{ encoding: "utf-8" },
 		);
 		if (create.status !== 0) {
 			throw new Error(`docker run failed: ${create.stderr || create.stdout}`.trim());
 		}
 		created = true;
+
+		const installDeps = spawnSync(
+			"docker",
+			[
+				"exec",
+				container,
+				"sh",
+				"-lc",
+				"set -e; apt-get update >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nodejs npm python3 python3-venv unzip poppler-utils >/dev/null; curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null; ln -sf /root/.local/bin/uv /usr/local/bin/uv; ln -sf /root/.local/bin/uvx /usr/local/bin/uvx",
+			],
+			{ encoding: "utf-8" },
+		);
+		if (installDeps.status !== 0) {
+			throw new Error(`docker exec install failed: ${installDeps.stderr || installDeps.stdout}`.trim());
+		}
 
 		const sandboxConfig = parseSandboxArg(`docker:${container}`);
 		await validateSandbox(sandboxConfig);
@@ -997,16 +1100,19 @@ async function main(): Promise<void> {
 		await runCheck(3, "Group trigger flow (allowlist JID + name fragment + blocked group)", checkGroupTriggers),
 	);
 	results.push(
-		await runCheck(4, "Shared-number mode (MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0, no loops)", checkSharedNumberMode),
+		await runCheck(4, "Group pending history (non-trigger chatter included on next mention)", checkGroupPendingHistory),
 	);
 	results.push(
-		await runCheck(5, "Media ingestion (image/doc/video saved + context attachment payload)", checkMediaIngestion),
+		await runCheck(5, "Shared-number mode (MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0, no loops)", checkSharedNumberMode),
 	);
-	results.push(await runCheck(6, "Reconnect reliability (offline queue + flush)", checkReconnectReliability));
-	results.push(await runCheck(7, "Verbose detail toggle (MOM_WA_VERBOSE_DETAILS=0/1)", checkVerboseToggle));
-	results.push(await runCheck(8, "Events (immediate, one-shot, periodic)", checkEvents));
-	results.push(await runCheck(9, "IPC watcher (atomic files + schedule/message schema)", checkIpc));
-	results.push(await runCheck(10, "Sandbox sanity (docker execution + persistence)", checkSandbox));
+	results.push(
+		await runCheck(6, "Media ingestion (image/doc/video saved + context attachment payload)", checkMediaIngestion),
+	);
+	results.push(await runCheck(7, "Reconnect reliability (offline queue + flush)", checkReconnectReliability));
+	results.push(await runCheck(8, "Verbose detail toggle (MOM_WA_VERBOSE_DETAILS=0/1)", checkVerboseToggle));
+	results.push(await runCheck(9, "Events (immediate, one-shot, periodic)", checkEvents));
+	results.push(await runCheck(10, "IPC watcher (atomic files + schedule/message schema)", checkIpc));
+	results.push(await runCheck(11, "Sandbox sanity (docker execution + persistence)", checkSandbox));
 
 	printResults(results);
 

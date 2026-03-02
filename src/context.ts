@@ -30,15 +30,20 @@ interface LogMessage {
 }
 
 const SESSION_TIMESTAMP_PREFIX_REGEX = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\] /;
+const LEGACY_PENDING_HISTORY_MARKER = "\n[Current message - respond to this]\n";
 const WHATSAPP_ATTACHMENTS_MARKER = "\n\n<whatsapp_attachments>\n";
 
 function normalizeMessageText(text: string): string {
 	let normalized = text.replace(SESSION_TIMESTAMP_PREFIX_REGEX, "");
+	const pendingHistoryIdx = normalized.indexOf(LEGACY_PENDING_HISTORY_MARKER);
+	if (pendingHistoryIdx !== -1) {
+		normalized = normalized.slice(pendingHistoryIdx + LEGACY_PENDING_HISTORY_MARKER.length);
+	}
 	const attachmentsIdx = normalized.indexOf(WHATSAPP_ATTACHMENTS_MARKER);
 	if (attachmentsIdx !== -1) {
 		normalized = normalized.substring(0, attachmentsIdx);
 	}
-	return normalized;
+	return normalized.trim();
 }
 
 function normalizeMessageTimestamp(ts: string | number | undefined): string | undefined {

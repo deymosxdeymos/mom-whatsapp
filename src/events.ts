@@ -287,8 +287,10 @@ export class EventsWatcher {
 			event.type === "immediate" ? "immediate" : event.type === "one-shot" ? event.at : event.schedule;
 		const syntheticEvent: WhatsAppEvent = {
 			type: "mention",
+			source: "scheduled",
 			channel: event.channelId,
 			user: "EVENT",
+			rawText: `[EVENT:${filename}:${event.type}:${scheduleInfo}] ${event.text}`,
 			text: `[EVENT:${filename}:${event.type}:${scheduleInfo}] ${event.text}`,
 			ts: runStart.toString(),
 			attachments: [],

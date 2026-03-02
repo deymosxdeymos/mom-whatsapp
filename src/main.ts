@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 
+// Default timezone to WIB (Asia/Jakarta) unless explicitly overridden
+if (!process.env.TZ) {
+	process.env.TZ = process.env.MOM_WA_TIMEZONE || "Asia/Jakarta";
+}
+
 import { existsSync } from "fs";
 import { appendFile, readFile, writeFile } from "fs/promises";
 import { join, resolve } from "path";
 import { buildArtifactUrl, getArtifactsBaseUrl, getArtifactsRoot } from "./artifacts.js";
 import { type AgentRunner, getOrCreateRunner, type RunnerSessionStats, translateToHostPath } from "./agent.js";
 import { createEventsWatcher } from "./events.js";
+import { distillExportFileToWorkspace } from "./distill.js";
+import { removeGroupHistoryEntries } from "./group-history.js";
 import { createIpcWatcher } from "./ipc.js";
 import { normalizeWhatsAppJid } from "./jid.js";
+import { parseModelSpecWithAliases } from "./model-aliases.js";
+import { shouldClearPendingGroupHistory } from "./pending-group-history.js";
 import * as log from "./log.js";
 import {
 	createImmediateTaskEvent,
@@ -27,6 +36,10 @@ import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.
 import { ChannelStore } from "./store.js";
 import { formatVerboseDetailsMessage } from "./verbose.js";
 import { type MomHandler, type WhatsAppBot, WhatsAppBot as WhatsAppBotClass, type WhatsAppEvent } from "./whatsapp.js";
+import {
+	ensureWorkspaceBootstrapFiles,
+} from "./workspace-files.js";
+import { handleWorkspaceCommand } from "./workspace-commands.js";
 
 function readNumberEnv(name: string, fallback: number): number {
 	const value = process.env[name];
@@ -36,7 +49,7 @@ function readNumberEnv(name: string, fallback: number): number {
 }
 
 const MOM_WA_AUTH_DIR = process.env.MOM_WA_AUTH_DIR;
-const MOM_WA_BOT_NAME = process.env.MOM_WA_BOT_NAME || "mom";
+const MOM_WA_BOT_NAME = process.env.MOM_WA_BOT_NAME || "ujang";
 const MOM_WA_ALLOWED_GROUPS = process.env.MOM_WA_ALLOWED_GROUPS;
 const MOM_WA_GROUP_TRIGGER_ALIASES = (process.env.MOM_WA_GROUP_TRIGGER_ALIASES || "")
 	.split(",")
@@ -65,12 +78,16 @@ const MOM_WA_OWNER_JIDS = new Set(
 interface ParsedArgs {
 	workingDir?: string;
 	sandbox: SandboxConfig;
+	distillExportPath?: string;
+	distillChannelId?: string;
 }
 
 function parseArgs(): ParsedArgs {
 	const args = process.argv.slice(2);
 	let sandbox: SandboxConfig = { type: "host" };
 	let workingDir: string | undefined;
+	let distillExportPath: string | undefined;
+	let distillChannelId: string | undefined;
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -78,6 +95,14 @@ function parseArgs(): ParsedArgs {
 			sandbox = parseSandboxArg(arg.slice("--sandbox=".length));
 		} else if (arg === "--sandbox") {
 			sandbox = parseSandboxArg(args[++i] || "");
+		} else if (arg.startsWith("--distill-export=")) {
+			distillExportPath = resolve(arg.slice("--distill-export=".length));
+		} else if (arg === "--distill-export") {
+			distillExportPath = resolve(args[++i] || "");
+		} else if (arg.startsWith("--distill-channel=")) {
+			distillChannelId = arg.slice("--distill-channel=".length);
+		} else if (arg === "--distill-channel") {
+			distillChannelId = args[++i];
 		} else if (!arg.startsWith("-")) {
 			workingDir = arg;
 		}
@@ -86,13 +111,37 @@ function parseArgs(): ParsedArgs {
 	return {
 		workingDir: workingDir ? resolve(workingDir) : undefined,
 		sandbox,
+		distillExportPath,
+		distillChannelId,
 	};
 }
 
 const parsedArgs = parseArgs();
 if (!parsedArgs.workingDir) {
-	console.error("Usage: mom-whatsapp [--sandbox=host|docker:<name>] <working-directory>");
+	console.error(
+		"Usage: mom-whatsapp [--sandbox=host|docker:<name>] [--distill-export <path> --distill-channel <chat-jid>] <working-directory>",
+	);
 	process.exit(1);
+}
+if (parsedArgs.distillExportPath) {
+	if (!parsedArgs.distillChannelId) {
+		console.error("Missing required flag: --distill-channel <chat-jid>");
+		process.exit(1);
+	}
+	await ensureWorkspaceBootstrapFiles(parsedArgs.workingDir);
+	const summary = await distillExportFileToWorkspace({
+		workingDir: parsedArgs.workingDir,
+		channelId: parsedArgs.distillChannelId,
+		exportPath: parsedArgs.distillExportPath,
+	});
+	console.log(
+		[
+			`Distilled ${summary.messageCount} messages from ${summary.participantCount} participants.`,
+			`Wrote channel SOUL.md, MEMORY.md, and note files for ${parsedArgs.distillChannelId}.`,
+			`Top participants: ${summary.topParticipants.join(", ") || "(none)"}`,
+		].join("\n"),
+	);
+	process.exit(0);
 }
 if (!MOM_WA_AUTH_DIR) {
 	console.error("Missing env: MOM_WA_AUTH_DIR");
@@ -101,6 +150,7 @@ if (!MOM_WA_AUTH_DIR) {
 
 const { workingDir, sandbox } = { workingDir: parsedArgs.workingDir, sandbox: parsedArgs.sandbox };
 await validateSandbox(sandbox, workingDir);
+await ensureWorkspaceBootstrapFiles(workingDir);
 
 interface ChannelState {
 	running: boolean;
@@ -126,12 +176,19 @@ function getState(channelId: string): ChannelState {
 	return state;
 }
 
-function getWorkspaceMemoryPath(): string {
-	return join(workingDir, "MEMORY.md");
-}
+async function clearPendingGroupHistoryForEvent(event: WhatsAppEvent, state: ChannelState): Promise<void> {
+	if (!shouldClearPendingGroupHistory(event)) {
+		return;
+	}
 
-function getChannelMemoryPath(channelId: string): string {
-	return join(workingDir, channelId, "MEMORY.md");
+	try {
+		await removeGroupHistoryEntries(state.store.getChannelDir(event.channel), event.pendingHistory);
+	} catch (err) {
+		log.logWarning(
+			`[${event.channel}] Failed to clear pending group history`,
+			err instanceof Error ? err.message : String(err),
+		);
+	}
 }
 
 function parseCommand(text: string): { name: string; args: string[] } | null {
@@ -310,7 +367,7 @@ function parsePeriodicTaskArgs(args: string[]): { ok: true; value: ParsedPeriodi
 
 function formatHelp(): string {
 	return [
-		"*Mom command help*",
+		"*Ujang command help*",
 		"!help",
 		"!stop                       # stop active run in this chat",
 		"!status",
@@ -319,9 +376,18 @@ function formatHelp(): string {
 		"!model <provider/model>      # set model (owner)",
 		"!thinking                    # show thinking level",
 		"!thinking <off|minimal|low|medium|high|xhigh>  # set (owner)",
+		"!remember <text>",
+		"!remember --global <text>    # owner",
 		"!memory show [global|channel]",
 		"!memory add <text>",
 		"!memory add --global <text>  # owner",
+		"!soul show [global|channel]",
+		"!soul set <text>",
+		"!soul set --global <text>    # owner",
+		"!note list [global|channel]",
+		"!note show [global|channel] <name>",
+		"!note add <name> <text>",
+		"!note add --global <name> <text>  # owner",
 		"!task list",
 		"!task now <text>                # owner",
 		"!task once <ISO time> <text>    # owner",
@@ -354,7 +420,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 		const ownerScoped = MOM_WA_OWNER_JIDS.size > 0;
 		const artifactBaseUrl = await getArtifactsBaseUrl();
 		const status = [
-			"*Mom status*",
+			"*Ujang status*",
 			`Connected: ${wa.isConnected() ? "yes" : "no"}`,
 			`Sandbox: ${sandbox.type === "docker" ? `docker:${sandbox.container}` : "host"}`,
 			`Model: ${model.provider}/${model.modelId}`,
@@ -388,12 +454,12 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			await wa.postMessage(event.channel, "_Only configured owner JIDs can change model._");
 			return true;
 		}
-		const [provider, ...rest] = command.args[0].split("/");
-		const hasProvider = rest.length > 0;
-		const resolvedProvider = hasProvider ? provider : "anthropic";
-		const resolvedModel = hasProvider ? rest.join("/") : provider;
+		const resolvedSpec = parseModelSpecWithAliases(command.args[0], {
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-6",
+		});
 		try {
-			const updated = state.runner.setModel(resolvedProvider, resolvedModel);
+			const updated = state.runner.setModel(resolvedSpec.provider, resolvedSpec.modelId);
 			await wa.postMessage(event.channel, `Model set: ${updated.provider}/${updated.modelId}`);
 		} catch (err) {
 			await wa.postMessage(
@@ -424,56 +490,12 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 		return true;
 	}
 
-	if (command.name === "memory") {
-		if (command.args.length === 0) {
-			await wa.postMessage(event.channel, "Usage: !memory show [global|channel] | !memory add [--global] <text>");
-			return true;
-		}
-		const sub = command.args[0].toLowerCase();
-		if (sub === "show") {
-			const scope = command.args[1]?.toLowerCase() === "global" ? "global" : "channel";
-			if (scope === "channel") {
-				state.store.getChannelDir(event.channel);
-			}
-			const path = scope === "global" ? getWorkspaceMemoryPath() : getChannelMemoryPath(event.channel);
-			if (!existsSync(path)) {
-				await wa.postMessage(event.channel, `Memory (${scope}) is empty.`);
-				return true;
-			}
-			const content = (await readFile(path, "utf-8")).trim();
-			await wa.postMessage(
-				event.channel,
-				content ? `Memory (${scope}):\n${content}` : `Memory (${scope}) is empty.`,
-			);
-			return true;
-		}
-		if (sub === "add") {
-			const globalFlag = command.args[1] === "--global";
-			if (globalFlag && !isOwnerJid(event.user)) {
-				await wa.postMessage(event.channel, "_Only configured owner JIDs can modify global memory._");
-				return true;
-			}
-			const text = (globalFlag ? command.args.slice(2) : command.args.slice(1)).join(" ").trim();
-			if (!text) {
-				await wa.postMessage(event.channel, "_Usage: !memory add [--global] <text>_");
-				return true;
-			}
-			const scope = globalFlag ? "global" : "channel";
-			if (scope === "channel") {
-				state.store.getChannelDir(event.channel);
-			}
-			const path = scope === "global" ? getWorkspaceMemoryPath() : getChannelMemoryPath(event.channel);
-			const existing = existsSync(path) ? await readFile(path, "utf-8") : "";
-			const line = `- ${text}`;
-			if (existing.trim().length === 0) {
-				await writeFile(path, `${line}\n`, "utf-8");
-			} else {
-				await appendFile(path, `${line}\n`, "utf-8");
-			}
-			await wa.postMessage(event.channel, `Added to ${scope} memory.`);
-			return true;
-		}
-		await wa.postMessage(event.channel, "_Unknown memory command. Use show/add._");
+	if (
+		await handleWorkspaceCommand(command, event, state, wa, {
+			workingDir,
+			isOwnerJid,
+		})
+	) {
 		return true;
 	}
 
@@ -823,6 +845,11 @@ function createWhatsAppContext(
 	state: ChannelState,
 	hooks?: { onOutput?: () => void; onToolExecution?: () => void },
 ) {
+	// Seed display names from the channel log so users who haven't messaged this
+	// session still appear with their real names (not just phone numbers).
+	const logPath = join(state.store.getChannelDir(event.channel), "log.jsonl");
+	wa.seedUsersFromLog(logPath);
+
 	const user = wa.getUser(event.user);
 	let lastMessageTs: string | null = null;
 	// Track the full logical text last sent to detect duplicates across bubble splits.
@@ -856,11 +883,12 @@ function createWhatsAppContext(
 	return {
 		message: {
 			text: event.text,
-			rawText: event.text,
+			rawText: event.rawText,
 			user: event.user,
 			userName: user?.userName,
 			channel: event.channel,
 			ts: event.ts,
+			pendingHistory: event.pendingHistory,
 			attachments: (event.attachments || []).map((a) => ({ local: a.local })),
 		},
 		channelName: wa.getChannel(event.channel)?.name,
@@ -942,6 +970,7 @@ const handler: MomHandler = {
 		const state = getState(event.channel);
 		const commandHandled = await handleCommand(event, state, wa);
 		if (commandHandled) {
+			await clearPendingGroupHistoryForEvent(event, state);
 			return;
 		}
 
@@ -952,6 +981,7 @@ const handler: MomHandler = {
 
 		state.running = true;
 		state.stopRequested = false;
+		let shouldClearConsumedPendingGroupHistory = false;
 
 		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
 
@@ -1039,7 +1069,7 @@ const handler: MomHandler = {
 						}
 						const delayMs = RUN_BASE_RETRY_MS * Math.pow(2, attempt - 1);
 						log.logWarning(
-							`[${event.channel}] Run failed (attempt ${attempt}/${RUN_MAX_RETRIES}), retrying in ${delayMs}ms`,
+							`[${event.channel}] Run failed (attempt ${attempt}/${RUN_MAX_RETRIES}), retrying in ${delayMs}ms: ${result.errorMessage}`,
 						);
 						await sleep(delayMs);
 						continue;
@@ -1051,6 +1081,7 @@ const handler: MomHandler = {
 					break;
 				}
 
+				shouldClearConsumedPendingGroupHistory = shouldClearPendingGroupHistory(event);
 				await react("✅");
 				break;
 			} catch (err) {
@@ -1102,6 +1133,10 @@ const handler: MomHandler = {
 					}
 				}
 			}
+		}
+
+		if (shouldClearConsumedPendingGroupHistory) {
+			await clearPendingGroupHistoryForEvent(event, state);
 		}
 
 		state.running = false;

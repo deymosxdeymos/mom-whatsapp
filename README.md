@@ -25,7 +25,7 @@ npm install @mariozechner/pi-mom-whatsapp
 
 ```bash
 export MOM_WA_AUTH_DIR="$HOME/.pi/mom-whatsapp/wa-auth"
-export MOM_WA_BOT_NAME="mom"
+export MOM_WA_BOT_NAME="ujang"
 # Optional: comma-separated list of allowed group JIDs or name fragments
 export MOM_WA_ALLOWED_GROUPS="1203...@g.us,engineering"
 # Optional: extra group trigger words (comma-separated), e.g. nickname aliases
@@ -79,11 +79,22 @@ Use text commands in DM/group chats:
 - `!stop` - stop active run in this chat (`/stop` and plain `stop` also work)
 - `!model` - show current model
 - `!model <provider/model-id>` - set default model for future runs in this workspace
+- `!model gpt-5.4` - alias for `openai-codex/gpt-5.4`
+- `!model fireworks/kimi-k2.5-turbo` - alias for `fireworks/accounts/fireworks/routers/kimi-k2p5-turbo`
 - `!thinking` - show current thinking level
 - `!thinking <off|minimal|low|medium|high|xhigh>` - set thinking level
+- `!remember <text>` - append to channel memory
+- `!remember --global <text>` - append to global workspace memory
 - `!memory show [global|channel]` - show memory content
 - `!memory add <text>` - append to channel memory
 - `!memory add --global <text>` - append to global workspace memory
+- `!soul show [global|channel]` - show persona file content
+- `!soul set <text>` - replace channel persona
+- `!soul set --global <text>` - replace global persona
+- `!note list [global|channel]` - list note files
+- `!note show [global|channel] <name>` - show a note file
+- `!note add <name> <text>` - create/replace a channel note
+- `!note add --global <name> <text>` - create/replace a global note
 - `!task list` - list scheduled tasks for this chat
 - `!task now <text>` - queue an immediate scheduled task message
 - `!task once <ISO-8601-with-timezone> <text>` - schedule one-shot task (example: `2026-03-01T09:00:00+07:00`)
@@ -127,7 +138,23 @@ mom-whatsapp [options] <working-directory>
 Options:
   --sandbox=host
   --sandbox=docker:<container-name>
+  --distill-export <path>
+  --distill-channel <chat-jid>
 ```
+
+One-shot group vibe distillation from a WhatsApp export:
+
+```bash
+mom-whatsapp --distill-export ~/Downloads/group-chat.txt --distill-channel 1203...@g.us ./data
+```
+
+This parses the exported chat text and writes channel-scoped:
+- `SOUL.md`
+- `MEMORY.md`
+- `memory/people.md`
+- `memory/running-jokes.md` when repeated bits are detected
+
+If the configured model/API key is available, mom-whatsapp first parses the export deterministically, then asks the model to refine those files from transcript excerpts. If no model auth is available, it falls back to the deterministic distillation only.
 
 Authentication helper:
 
@@ -141,7 +168,7 @@ npm run wa:auth -- --pairing-code --phone 14155551234
 | Variable | Required | Description |
 |---|---|---|
 | `MOM_WA_AUTH_DIR` | yes | Directory for Baileys auth/session files |
-| `MOM_WA_BOT_NAME` | no | Group trigger token (default: `mom`) |
+| `MOM_WA_BOT_NAME` | no | Group trigger token (default: `ujang`) |
 | `MOM_WA_GROUP_TRIGGER_ALIASES` | no | CSV extra trigger tokens for groups (e.g. `jang,bro`) |
 | `MOM_WA_ALLOWED_GROUPS` | no | CSV allowlist of group JIDs and/or group name fragments |
 | `MOM_WA_VERBOSE_DETAILS` | no | `1` to emit tool detail stream to chat, default off |
@@ -149,7 +176,7 @@ npm run wa:auth -- --pairing-code --phone 14155551234
 | `MOM_WA_ARTIFACTS_URL_FILE` | no | File containing base URL (default `/tmp/artifacts-url.txt`) |
 | `MOM_WA_ARTIFACTS_ROOT` | no | Artifact root directory (default `<working-dir>/artifacts/files`) |
 | `MOM_WA_ASSISTANT_HAS_OWN_NUMBER` | no | `0` for shared-number setups (bot prefixes outbound text with bot name) |
-| `MOM_WA_MODEL` | no | Default model override, e.g. `anthropic/claude-sonnet-4-6` |
+| `MOM_WA_MODEL` | no | Default model override, e.g. `anthropic/claude-sonnet-4-6`, `gpt-5.4`, or `fireworks/kimi-k2.5-turbo` |
 | `MOM_WA_OWNER_JIDS` | no | Comma-separated owner JIDs allowed to run privileged chat commands (`!model`, `!thinking`, global memory writes) |
 | `MOM_WA_PAIRING_PHONE` | no | Optional phone number for `npm run wa:auth` pairing-code mode (digits only, e.g. `14155551234`) |
 | `ANTHROPIC_API_KEY` | no* | API key if not using `auth.json` |
@@ -158,14 +185,18 @@ npm run wa:auth -- --pairing-code --phone 14155551234
 
 ```text
 <data-dir>/
+  SOUL.md
   MEMORY.md
+  memory/
   settings.json
   skills/
   events/
   ipc/
   task-runs.jsonl
   <chat-jid>/
+    SOUL.md
     MEMORY.md
+    memory/
     log.jsonl
     context.jsonl
     attachments/
@@ -173,14 +204,16 @@ npm run wa:auth -- --pairing-code --phone 14155551234
     skills/
 ```
 
+On first startup, ujang creates a starter global `SOUL.md` if one does not exist yet. The template is derived from OpenClaw's `SOUL.md` pattern and is meant to be edited, not treated as fixed.
+
 ## Notes
 
 - WhatsApp has no Slack-style threads, so details are either suppressed (default) or emitted directly in chat (`MOM_WA_VERBOSE_DETAILS=1`).
 - Message edit/delete semantics differ from Slack; final responses are follow-up messages.
 - Inbound media without text is still processed and forwarded as attachment context.
-- For non-image attachments, mom attempts automatic text extraction and includes extracted snippets in model context.
-- PDF/Office extraction requires `pdftotext` and `unzip` where extraction commands execute: in Docker sandbox mode this runs inside the sandbox container (`./docker.sh create` installs `poppler-utils` + `unzip` there); in host sandbox mode it uses host-installed binaries.
-- When `attach` uploads a file under artifacts root, mom auto-posts a public artifact URL if configured.
+- For non-image attachments, ujang attempts automatic text extraction and includes extracted snippets in model context.
+- PDF/Office extraction requires `pdftotext` and `unzip` where extraction commands execute: in Docker sandbox mode this runs inside the sandbox container (`./docker.sh create` installs `poppler-utils` + `unzip` there on Debian); in host sandbox mode it uses host-installed binaries.
+- When `attach` uploads a file under artifacts root, ujang auto-posts a public artifact URL if configured.
 - Shared-number mode (`MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0`) prefixes outbound text with bot name and avoids self-loop processing.
 
 ## Security
@@ -216,7 +249,7 @@ If validation fails, startup exits with `SANDBOX_MOUNT_NOT_ALLOWED` and prints t
 
 Helper scripts:
 
-- `./docker.sh create ./data` to create sandbox container
+- `./docker.sh create ./data` to create a Debian sandbox container with `node`, `npm`, `python3`, `uv`, `unzip`, and `pdftotext`
 - `./dev.sh` for local watch-mode run
 - `npm run runtime:checklist` to execute the focused runtime checklist harness
 

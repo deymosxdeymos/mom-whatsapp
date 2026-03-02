@@ -4,6 +4,7 @@ import makeWASocket, {
 	downloadMediaMessage,
 	fetchLatestWaWebVersion,
 	makeCacheableSignalKeyStore,
+	normalizeMessageContent,
 	type proto,
 	useMultiFileAuthState,
 	type WAMessage,
@@ -12,6 +13,7 @@ import makeWASocket, {
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { open, writeFile } from "fs/promises";
 import { basename, extname, join } from "path";
+import { appendGroupHistoryEntry, loadGroupHistory, type GroupHistoryEntry } from "./group-history.js";
 import { normalizeWhatsAppJid } from "./jid.js";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore } from "./store.js";
@@ -25,10 +27,13 @@ const MOM_WA_DEBUG_INCOMING = process.env.MOM_WA_DEBUG_INCOMING === "1";
 
 export interface WhatsAppEvent {
 	type: "mention" | "dm";
+	source: "whatsapp" | "scheduled";
 	channel: string;
 	ts: string;
 	user: string;
 	text: string;
+	rawText: string;
+	pendingHistory?: GroupHistoryEntry[];
 	attachments?: Attachment[];
 	messageKey?: proto.IMessageKey;
 }
@@ -63,6 +68,7 @@ export interface BotContext {
 		userName?: string;
 		channel: string;
 		ts: string;
+		pendingHistory?: GroupHistoryEntry[];
 		attachments: Array<{ local: string }>;
 	};
 	channelName?: string;
@@ -187,6 +193,7 @@ export class WhatsAppBot {
 	private channels = new Map<string, WhatsAppChannel>();
 	private users = new Map<string, WhatsAppUser>();
 	private queues = new Map<string, ChannelQueue>();
+	private seededLogPaths = new Set<string>();
 	private startupTs = 0;
 	private botJids = new Set<string>();
 	private lidToPhoneMap = new Map<string, string>();
@@ -355,7 +362,18 @@ export class WhatsAppBot {
 				`[debug:incoming] channel=${channelId} sender=${sender} raw=${JSON.stringify(text)} cleaned=${JSON.stringify(cleanedText)} mention=${mentioned} reply=${repliedToBot} stop=${stopRequested} triggered=${botTriggered}`,
 			);
 		}
-		if (!botTriggered) return;
+		if (!botTriggered) {
+			if (!isDm && tsMs >= this.startupTs) {
+				await this.recordPendingGroupHistory(channelId, {
+					messageId: msg.key.id || undefined,
+					ts: String(tsMs),
+					user: sender,
+					userName,
+					text: cleanedText || text.trim(),
+				});
+			}
+			return;
+		}
 
 		const attachments = stopRequested ? [] : await this.downloadMediaAttachments(channelId, msg, tsMs);
 		// Only drop if there's truly nothing — bare @mentions are valid triggers,
@@ -364,10 +382,13 @@ export class WhatsAppBot {
 
 		const event: WhatsAppEvent = {
 			type: isDm ? "dm" : "mention",
+			source: "whatsapp",
 			channel: channelId,
 			user: sender,
+			rawText: text,
 			text: stopRequested ? "stop" : cleanedText || (attachments.length > 0 ? "Please analyze the attached files." : "hey"),
 			ts: String(tsMs),
+			pendingHistory: isDm ? undefined : this.loadPendingGroupHistory(channelId),
 			attachments,
 			messageKey: msg.key,
 		};
@@ -397,6 +418,17 @@ export class WhatsAppBot {
 			return;
 		}
 		queue.enqueue(() => this.handler.handleEvent(event, this));
+	}
+
+	private loadPendingGroupHistory(channelId: string): GroupHistoryEntry[] {
+		return loadGroupHistory(this.config.store.getChannelDir(channelId));
+	}
+
+	private async recordPendingGroupHistory(channelId: string, entry: GroupHistoryEntry): Promise<void> {
+		if (!entry.text.trim()) {
+			return;
+		}
+		await appendGroupHistoryEntry(this.config.store.getChannelDir(channelId), entry);
 	}
 
 	private async logUserMessage(event: WhatsAppEvent, userName: string): Promise<void> {
@@ -587,12 +619,13 @@ export class WhatsAppBot {
 	}
 
 	private getContextInfos(message: proto.IMessage | null | undefined): Array<proto.IContextInfo | null | undefined> {
-		if (!message) return [];
+		const normalized = normalizeMessageContent(message) || message;
+		if (!normalized) return [];
 		return [
-			message.extendedTextMessage?.contextInfo,
-			message.imageMessage?.contextInfo,
-			message.videoMessage?.contextInfo,
-			message.documentMessage?.contextInfo,
+			normalized.extendedTextMessage?.contextInfo,
+			normalized.imageMessage?.contextInfo,
+			normalized.videoMessage?.contextInfo,
+			normalized.documentMessage?.contextInfo,
 		];
 	}
 
@@ -635,12 +668,13 @@ export class WhatsAppBot {
 	}
 
 	private extractText(message: proto.IMessage | null | undefined): string {
-		if (!message) return "";
-		if (message.conversation) return message.conversation;
-		if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
-		if (message.imageMessage?.caption) return message.imageMessage.caption;
-		if (message.videoMessage?.caption) return message.videoMessage.caption;
-		if (message.documentMessage?.caption) return message.documentMessage.caption;
+		const normalized = normalizeMessageContent(message) || message;
+		if (!normalized) return "";
+		if (normalized.conversation) return normalized.conversation;
+		if (normalized.extendedTextMessage?.text) return normalized.extendedTextMessage.text;
+		if (normalized.imageMessage?.caption) return normalized.imageMessage.caption;
+		if (normalized.videoMessage?.caption) return normalized.videoMessage.caption;
+		if (normalized.documentMessage?.caption) return normalized.documentMessage.caption;
 		return "";
 	}
 
@@ -690,6 +724,26 @@ export class WhatsAppBot {
 				if (meta.subject) {
 					this.channels.set(jid, { id: jid, name: meta.subject });
 				}
+				// Populate participants into users map so agent can tag them
+				if (meta.participants) {
+					for (const p of meta.participants) {
+						const rawJid = p.id;
+						const resolvedJid = await this.translateJid(rawJid);
+						// Only store phone JIDs — skip unresolved LIDs
+						if (!resolvedJid.endsWith("@lid")) {
+							const phone = resolvedJid.split("@")[0].split(":")[0];
+							const existing = this.users.get(resolvedJid);
+							if (!existing) {
+								const displayName = p.notify || p.name || phone;
+								this.users.set(resolvedJid, {
+									id: resolvedJid,
+									userName: phone,
+									displayName,
+								});
+							}
+						}
+					}
+				}
 			}
 		} catch (err) {
 			log.logWarning("Failed to sync WhatsApp group metadata", err instanceof Error ? err.message : String(err));
@@ -722,39 +776,67 @@ export class WhatsAppBot {
 		msg: WAMessage,
 		timestampMs: number,
 	): Promise<Attachment[]> {
-		const hasMedia = Boolean(msg.message?.imageMessage || msg.message?.videoMessage || msg.message?.documentMessage);
+		const normalizedMessage = normalizeMessageContent(msg.message) || msg.message;
+		const normalizedMsg = normalizedMessage ? { ...msg, message: normalizedMessage } : msg;
+		const hasMedia = Boolean(
+			normalizedMessage?.imageMessage || normalizedMessage?.videoMessage || normalizedMessage?.documentMessage,
+		);
 		if (!hasMedia || !this.sock) return [];
 
-		try {
-			const buffer = await this.deps.downloadMedia(msg, this.sock);
+		const mediaType = normalizedMessage?.documentMessage
+			? "document"
+			: normalizedMessage?.imageMessage
+				? "image"
+				: normalizedMessage?.videoMessage
+					? "video"
+					: "unknown";
+		const mimeType =
+			normalizedMessage?.documentMessage?.mimetype ||
+			normalizedMessage?.imageMessage?.mimetype ||
+			normalizedMessage?.videoMessage?.mimetype ||
+			"unknown";
+		const originalFileName = normalizedMessage?.documentMessage?.fileName || this.detectAttachmentFilename(normalizedMsg);
+		log.logInfo(
+			`[${channelId}] Incoming WhatsApp media: type=${mediaType} mimetype=${mimeType} filename=${JSON.stringify(originalFileName)} messageId=${msg.key?.id || "unknown"}`,
+		);
 
-			const fileNameWithExt = this.detectAttachmentFilename(msg);
+		try {
+			const buffer = await this.deps.downloadMedia(normalizedMsg, this.sock);
+
+			const fileNameWithExt = this.detectAttachmentFilename(normalizedMsg);
 			const timestampSeconds = (timestampMs / 1000).toString();
 			const localFileName = this.config.store.generateLocalFilename(fileNameWithExt, timestampSeconds);
 			const localPath = `${channelId}/attachments/${localFileName}`;
 			const absolutePath = join(this.config.workingDir, localPath);
 			mkdirSync(join(this.config.store.getChannelDir(channelId), "attachments"), { recursive: true });
 			await writeFile(absolutePath, buffer);
+			log.logInfo(
+				`[${channelId}] Saved WhatsApp media: local=${localPath} bytes=${buffer.byteLength} source=${JSON.stringify(fileNameWithExt)}`,
+			);
 
 			return [{ original: fileNameWithExt, local: localPath }];
 		} catch (err) {
-			log.logWarning("Failed to download WhatsApp media", err instanceof Error ? err.message : String(err));
+			log.logWarning(
+				`[${channelId}] Failed to download WhatsApp media`,
+				`type=${mediaType} mimetype=${mimeType} filename=${JSON.stringify(originalFileName)}\n${err instanceof Error ? err.message : String(err)}`,
+			);
 			return [];
 		}
 	}
 
 	private detectAttachmentFilename(msg: WAMessage): string {
-		const documentName = msg.message?.documentMessage?.fileName;
+		const normalizedMessage = normalizeMessageContent(msg.message) || msg.message;
+		const documentName = normalizedMessage?.documentMessage?.fileName;
 		if (documentName) return documentName;
 
-		if (msg.message?.imageMessage?.mimetype) {
-			return `image${extensionFromMime(msg.message.imageMessage.mimetype)}`;
+		if (normalizedMessage?.imageMessage?.mimetype) {
+			return `image${extensionFromMime(normalizedMessage.imageMessage.mimetype)}`;
 		}
-		if (msg.message?.videoMessage?.mimetype) {
-			return `video${extensionFromMime(msg.message.videoMessage.mimetype)}`;
+		if (normalizedMessage?.videoMessage?.mimetype) {
+			return `video${extensionFromMime(normalizedMessage.videoMessage.mimetype)}`;
 		}
-		if (msg.message?.documentMessage?.mimetype) {
-			return `document${extensionFromMime(msg.message.documentMessage.mimetype)}`;
+		if (normalizedMessage?.documentMessage?.mimetype) {
+			return `document${extensionFromMime(normalizedMessage.documentMessage.mimetype)}`;
 		}
 
 		return "attachment.bin";
@@ -828,6 +910,35 @@ export class WhatsAppBot {
 			this.rememberBotLoggedMessageId(channel, messageId);
 		}
 		void this.config.store.logBotResponse(channel, text, normalizedMessageIds);
+	}
+
+	seedUsersFromLog(logPath: string): void {
+		if (this.seededLogPaths.has(logPath)) return;
+		this.seededLogPaths.add(logPath);
+		if (!existsSync(logPath)) return;
+		try {
+			const lines = readFileSync(logPath, "utf-8").trim().split("\n");
+			for (const line of lines) {
+				if (!line) continue;
+				try {
+					const msg = JSON.parse(line) as { user?: string; userName?: string; displayName?: string };
+					if (!msg.user || msg.user === "bot" || !msg.userName) continue;
+					const existing = this.users.get(msg.user);
+					// Only update if the existing entry has a phone-number-only name
+					if (!existing || existing.userName === existing.id.split("@")[0].split(":")[0]) {
+						this.users.set(msg.user, {
+							id: msg.user,
+							userName: msg.userName,
+							displayName: msg.displayName || msg.userName,
+						});
+					}
+				} catch {
+					// skip malformed lines
+				}
+			}
+		} catch {
+			// ignore read errors
+		}
 	}
 
 	getUser(userId: string): WhatsAppUser | undefined {
@@ -922,13 +1033,37 @@ export class WhatsAppBot {
 		}
 	}
 
+	private async extractMentionJids(text: string): Promise<string[]> {
+		const mentions: string[] = [];
+		const phoneRegex = /@(\d+)/g;
+		let match: RegExpExecArray | null;
+		while ((match = phoneRegex.exec(text)) !== null) {
+			const phone = match[1];
+			// Find user whose JID numeric prefix matches
+			for (const user of this.users.values()) {
+				const userPhone = user.id.split("@")[0].split(":")[0];
+				if (userPhone === phone) {
+					// Translate LID JIDs to phone JIDs so WA resolves the mention
+					const resolved = await this.translateJid(user.id);
+					mentions.push(resolved);
+					break;
+				}
+			}
+		}
+		return mentions;
+	}
+
 	private async sendTextNow(jid: string, text: string): Promise<string> {
 		if (!this.sock) throw new Error("WhatsApp socket not initialized");
 		let lastError: Error | null = null;
 		const outboundText = this.config.assistantHasOwnNumber ? text : `${this.config.botName}: ${text}`;
+		const mentions = await this.extractMentionJids(outboundText);
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			try {
-				const sent = await this.sock.sendMessage(jid, { text: outboundText });
+				const sent = await this.sock.sendMessage(jid, {
+					text: outboundText,
+					...(mentions.length > 0 ? { mentions } : {}),
+				});
 				const messageId = sent?.key?.id;
 				this.rememberOutboundMessageId(messageId);
 				return messageId || `${Date.now()}`;

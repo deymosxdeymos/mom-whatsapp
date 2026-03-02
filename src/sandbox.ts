@@ -62,14 +62,14 @@ export async function validateSandbox(config: SandboxConfig, workspaceDir?: stri
 			config.container,
 			"sh",
 			"-lc",
-			"command -v pdftotext >/dev/null && command -v unzip >/dev/null",
+			"command -v pdftotext >/dev/null && command -v unzip >/dev/null && command -v node >/dev/null && command -v uv >/dev/null",
 		]);
 	} catch {
 		console.error(
-			`Error [SANDBOX_MISSING_EXTRACTOR_DEPS]: Container '${config.container}' is missing required attachment extraction dependencies (pdftotext, unzip).`,
+			`Error [SANDBOX_MISSING_RUNTIME_DEPS]: Container '${config.container}' is missing required sandbox dependencies (pdftotext, unzip, node, uv).`,
 		);
 		console.error(
-			`Install with: docker exec ${config.container} sh -lc 'apk add --no-cache poppler-utils unzip'`,
+			`Install with: docker exec ${config.container} sh -lc 'set -e; apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nodejs npm python3 python3-venv poppler-utils unzip && curl -LsSf https://astral.sh/uv/install.sh | sh && ln -sf /root/.local/bin/uv /usr/local/bin/uv && ln -sf /root/.local/bin/uvx /usr/local/bin/uvx'`,
 		);
 		process.exit(1);
 	}

@@ -1,12 +1,5 @@
-import { Agent, type AgentEvent, type ThinkingLevel } from "@mariozechner/pi-agent-core";
-import {
-	type Api,
-	getModels,
-	getProviders,
-	type ImageContent,
-	type KnownProvider,
-	type Model,
-} from "@mariozechner/pi-ai";
+import { Agent, type AgentEvent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
+import { type Api, type ImageContent, type Model } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -19,7 +12,7 @@ import {
 	SessionManager,
 	type Skill,
 } from "@mariozechner/pi-coding-agent";
-import { existsSync, readFileSync, statSync } from "fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { isAbsolute, join, relative, resolve as resolvePath } from "path";
@@ -27,6 +20,7 @@ import { maybeBuildArtifactUrl } from "./artifacts.js";
 import { extractAttachmentText } from "./attachment-extractor.js";
 import { MomSettingsManager, syncLogToSessionManager } from "./context.js";
 import * as log from "./log.js";
+import { parseModelSpecWithAliases } from "./model-aliases.js";
 import { createExecutor, type SandboxConfig } from "./sandbox.js";
 import type { ChannelStore } from "./store.js";
 import { createMomTools } from "./tools/index.js";
@@ -39,39 +33,66 @@ const VERBOSE_DETAILS = process.env.MOM_WA_VERBOSE_DETAILS === "1";
 const MAX_EXTRACTED_ATTACHMENTS = 4;
 const MAX_PARALLEL_ATTACHMENT_EXTRACTIONS = 2;
 const ATTACHMENT_EXTRACTION_BUDGET_MS = 15000;
+const SOUL_FILENAME = "SOUL.md";
+const MAX_SOUL_CHARS = 4000;
+const MAX_MEMORY_DIR_FILES_PER_SCOPE = 8;
+const MAX_MEMORY_FILE_CHARS = 1200;
+const MAX_MEMORY_DIR_TOTAL_CHARS = 5000;
+const LEGACY_EXECUTION_REQUEST_BLOCK =
+	/\n*<execution_request>\nThe user is explicitly asking you to run, verify, or inspect something with tools in this turn\.\nUse bash when feasible instead of answering hypothetically\.\n<\/execution_request>\n*/g;
+const POISONED_ASSISTANT_PATTERNS = [
+	"gw belum beneran nyoba jalaninnya di tool dulu.",
+	"kalau mau gue cek, suruh gue run dan gue bakal bilang hasil nyatanya.",
+	"container ini restricted",
+	"ga bisa execute code",
+	"ga ada python/node/bash yang bisa running script",
+	"ga ada python, node, atau bash yang bisa di execute",
+	"ga bisa spawn process atau execute code",
+] as const;
 
 const THINKING_LEVELS: ReadonlyArray<ThinkingLevel> = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 function parseModelSpec(spec: string): { provider: string; modelId: string } {
-	const trimmed = spec.trim();
-	if (!trimmed) {
-		return { provider: DEFAULT_PROVIDER, modelId: DEFAULT_MODEL_ID };
-	}
-	if (trimmed.includes("/")) {
-		const [provider, ...rest] = trimmed.split("/");
-		const modelId = rest.join("/").trim();
-		return {
-			provider: provider.trim() || DEFAULT_PROVIDER,
-			modelId: modelId || DEFAULT_MODEL_ID,
-		};
-	}
-	return { provider: DEFAULT_PROVIDER, modelId: trimmed };
+	return parseModelSpecWithAliases(spec, { provider: DEFAULT_PROVIDER, modelId: DEFAULT_MODEL_ID });
 }
 
 function resolveConfiguredModel(): { provider: string; modelId: string } {
 	return parseModelSpec(MOM_WA_MODEL || `${DEFAULT_PROVIDER}/${DEFAULT_MODEL_ID}`);
 }
 
-function resolveModelOrThrow(provider: string, modelId: string): Model<Api> {
-	const providerCandidate = provider as KnownProvider;
-	if (!getProviders().includes(providerCandidate)) {
+function formatPromptSpeaker(userName: string | undefined): string {
+	return userName?.trim() || "unknown";
+}
+
+export function formatPendingHistoryPrompt(
+	timestamp: string,
+	currentSpeaker: string,
+	currentText: string,
+	pendingHistory: ReadonlyArray<{ userName: string; text: string }>,
+): string {
+	if (pendingHistory.length === 0) {
+		return `[${timestamp}] [${currentSpeaker}]: ${currentText}`;
+	}
+
+	const historyLines = pendingHistory.map((entry) => `[${formatPromptSpeaker(entry.userName)}]: ${entry.text}`).join("\n");
+	return `[${timestamp}] [Chat messages since your last reply - for context]
+${historyLines}
+
+[Current message - respond to this]
+[${currentSpeaker}]: ${currentText}`;
+}
+
+function resolveModelOrThrow(modelRegistry: ModelRegistry, provider: string, modelId: string): Model<Api> {
+	const found = modelRegistry.find(provider, modelId);
+	if (found) {
+		return found;
+	}
+
+	const knownProviders = new Set(modelRegistry.getAll().map((model) => model.provider));
+	if (!knownProviders.has(provider)) {
 		throw new Error(`Unknown provider '${provider}'`);
 	}
-	const found = getModels(providerCandidate).find((model) => model.id === modelId);
-	if (!found) {
-		throw new Error(`Unknown model '${provider}/${modelId}'`);
-	}
-	return found;
+	throw new Error(`Unknown model '${provider}/${modelId}'`);
 }
 
 function isThinkingLevel(value: string): value is ThinkingLevel {
@@ -190,34 +211,185 @@ function getImageMimeType(filename: string): string | undefined {
 	return IMAGE_MIME_TYPES[filename.toLowerCase().split(".").pop() || ""];
 }
 
-function getMemory(channelDir: string): string {
+function truncateForPrompt(text: string, maxChars: number): string {
+	if (text.length <= maxChars) {
+		return text;
+	}
+	if (maxChars <= 3) {
+		return text.slice(0, maxChars);
+	}
+	return `${text.slice(0, maxChars - 3)}...`;
+}
+
+function extractMessageText(message: AgentMessage): string {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") {
+		return content;
+	}
+	if (!Array.isArray(content)) {
+		return "";
+	}
+	return content
+		.map((part) => {
+			if (!part || typeof part !== "object" || !("type" in part) || part.type !== "text") {
+				return "";
+			}
+			return "text" in part && typeof part.text === "string" ? part.text : "";
+		})
+		.filter((part) => part.length > 0)
+		.join("\n");
+}
+
+function sanitizeLegacyMessage(message: AgentMessage): AgentMessage | null {
+	if (message.role === "assistant") {
+		const text = extractMessageText(message).toLowerCase();
+		if (POISONED_ASSISTANT_PATTERNS.some((pattern) => text.includes(pattern))) {
+			return null;
+		}
+		return message;
+	}
+
+	if (message.role !== "user") {
+		return message;
+	}
+
+	if (typeof message.content === "string") {
+		const sanitized = message.content.replace(LEGACY_EXECUTION_REQUEST_BLOCK, "\n").trim();
+		if (sanitized === message.content) {
+			return message;
+		}
+		return { ...message, content: sanitized };
+	}
+
+	if (!Array.isArray(message.content)) {
+		return message;
+	}
+
+	let changed = false;
+	const sanitizedContent = message.content.map((part) => {
+		if (!part || typeof part !== "object" || !("type" in part) || part.type !== "text") {
+			return part;
+		}
+		if (!("text" in part) || typeof part.text !== "string") {
+			return part;
+		}
+		const sanitizedText = part.text.replace(LEGACY_EXECUTION_REQUEST_BLOCK, "\n").trim();
+		if (sanitizedText === part.text) {
+			return part;
+		}
+		changed = true;
+		return { ...part, text: sanitizedText };
+	});
+
+	return changed ? { ...message, content: sanitizedContent } : message;
+}
+
+function sanitizeLoadedMessages(messages: AgentMessage[], channelId: string): AgentMessage[] {
+	const sanitized = messages
+		.map((message) => sanitizeLegacyMessage(message))
+		.filter((message): message is AgentMessage => message !== null);
+	const removedCount = messages.length - sanitized.length;
+	if (removedCount > 0 || sanitized.length !== messages.length) {
+		log.logInfo(`[${channelId}] Sanitized loaded context: removed ${removedCount} poisoned message(s)`);
+	}
+	return sanitized;
+}
+
+export function readPromptFile(filePath: string, maxChars: number): string | null {
+	if (!existsSync(filePath)) {
+		return null;
+	}
+	try {
+		const content = readFileSync(filePath, "utf-8").trim();
+		if (!content) {
+			return null;
+		}
+		return truncateForPrompt(content, maxChars);
+	} catch (error) {
+		log.logWarning("Failed to read prompt file", `${filePath}: ${error}`);
+		return null;
+	}
+}
+
+function readMemoryDirectory(memoryDirPath: string, sectionLabel: string): string[] {
+	if (!existsSync(memoryDirPath)) {
+		return [];
+	}
+
+	try {
+		const fileNames = readdirSync(memoryDirPath, { withFileTypes: true })
+			.filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
+			.map((entry) => entry.name)
+			.sort((a, b) => b.localeCompare(a))
+			.slice(0, MAX_MEMORY_DIR_FILES_PER_SCOPE);
+
+		const parts: string[] = [];
+		let usedChars = 0;
+
+		for (const fileName of fileNames) {
+			if (usedChars >= MAX_MEMORY_DIR_TOTAL_CHARS) {
+				break;
+			}
+
+			const filePath = join(memoryDirPath, fileName);
+			const content = readPromptFile(filePath, MAX_MEMORY_FILE_CHARS);
+			if (!content) {
+				continue;
+			}
+
+			const remainingChars = MAX_MEMORY_DIR_TOTAL_CHARS - usedChars;
+			const boundedContent = truncateForPrompt(content, remainingChars);
+			if (!boundedContent) {
+				break;
+			}
+
+			parts.push(`### ${sectionLabel} (${fileName})\n${boundedContent}`);
+			usedChars += boundedContent.length;
+		}
+
+		return parts;
+	} catch (error) {
+		log.logWarning("Failed to read memory directory", `${memoryDirPath}: ${error}`);
+		return [];
+	}
+}
+
+export function getSoul(channelDir: string): string {
+	const parts: string[] = [];
+	const workspaceSoulPath = join(channelDir, "..", SOUL_FILENAME);
+	const channelSoulPath = join(channelDir, SOUL_FILENAME);
+
+	const workspaceSoul = readPromptFile(workspaceSoulPath, MAX_SOUL_CHARS);
+	if (workspaceSoul) {
+		parts.push(`### Workspace Soul\n${workspaceSoul}`);
+	}
+
+	const channelSoul = readPromptFile(channelSoulPath, MAX_SOUL_CHARS);
+	if (channelSoul) {
+		parts.push(`### Channel Soul\n${channelSoul}`);
+	}
+
+	return parts.join("\n\n");
+}
+
+export function getMemory(channelDir: string): string {
 	const parts: string[] = [];
 
 	// Read workspace-level memory (shared across all channels)
 	const workspaceMemoryPath = join(channelDir, "..", "MEMORY.md");
-	if (existsSync(workspaceMemoryPath)) {
-		try {
-			const content = readFileSync(workspaceMemoryPath, "utf-8").trim();
-			if (content) {
-				parts.push(`### Global Workspace Memory\n${content}`);
-			}
-		} catch (error) {
-			log.logWarning("Failed to read workspace memory", `${workspaceMemoryPath}: ${error}`);
-		}
+	const workspaceMemory = readPromptFile(workspaceMemoryPath, MAX_MEMORY_FILE_CHARS);
+	if (workspaceMemory) {
+		parts.push(`### Global Workspace Memory\n${workspaceMemory}`);
 	}
+	parts.push(...readMemoryDirectory(join(channelDir, "..", "memory"), "Global Memory Note"));
 
 	// Read channel-specific memory
 	const channelMemoryPath = join(channelDir, "MEMORY.md");
-	if (existsSync(channelMemoryPath)) {
-		try {
-			const content = readFileSync(channelMemoryPath, "utf-8").trim();
-			if (content) {
-				parts.push(`### Channel-Specific Memory\n${content}`);
-			}
-		} catch (error) {
-			log.logWarning("Failed to read channel memory", `${channelMemoryPath}: ${error}`);
-		}
+	const channelMemory = readPromptFile(channelMemoryPath, MAX_MEMORY_FILE_CHARS);
+	if (channelMemory) {
+		parts.push(`### Channel-Specific Memory\n${channelMemory}`);
 	}
+	parts.push(...readMemoryDirectory(join(channelDir, "memory"), "Channel Memory Note"));
 
 	if (parts.length === 0) {
 		return "(no working memory yet)";
@@ -262,9 +434,10 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	return Array.from(skillMap.values());
 }
 
-function buildSystemPrompt(
+export function buildSystemPrompt(
 	workspacePath: string,
 	channelId: string,
+	soul: string,
 	memory: string,
 	sandboxConfig: SandboxConfig,
 	channels: ChannelInfo[],
@@ -283,35 +456,41 @@ function buildSystemPrompt(
 		users.length > 0 ? users.map((u) => `${u.id}\t@${u.userName}\t${u.displayName}`).join("\n") : "(no users loaded)";
 
 	const envDescription = isDocker
-		? `You are running inside a Docker container (Alpine Linux).
+		? `You are running inside a Docker container (Debian Linux).
 - Bash working directory: / (use cd or absolute paths)
-- Install tools with: apk add <package>
+- Install tools with: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends <package>
 - Your changes persist across sessions`
 		: `You are running directly on the host machine.
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
 
-	return `You are mom, a WhatsApp assistant. You text like a real person — warm, direct, brief.
+	return `You are ujang, a WhatsApp assistant. Text like a real person, not an assistant.
 
 ## Personality
-Be witty and warm, but never overdo it. Think Donna from Suits texting Harvey — sharp, to the point, genuinely helpful, never robotic.
+Use SOUL.md as the main source of personality and social instinct. The built-in rules here are only guardrails.
 
-- Sound like a friend. No corporate jargon, no formal language.
-- Terse. The user is on their phone. Match their message length — brief when they're brief, detailed only when they're actually asking for information.
-- Adapt to their texting style. If they write lowercase, write lowercase. If they use slang, follow their lead.
-- Subtly witty, humorous, sarcastic when the vibe fits. Never forced. Skip any joke that might be unoriginal (why did the chicken cross the road, why 9 is afraid of 7, what did the ocean say to the beach — never).
-- Keep style fresh: do not reuse the same opener/catchphrase in consecutive replies (e.g. don't start every message with the same laugh token).
-- HARD RULE: Never open a message with a laugh token (wkwk, haha, lol, awkwk, ngakak). Starting with laughter is a crutch — skip it. If something is funny, your reply should show it through wit, not by announcing you're laughing.
-- Don't overuse nicknames or one verbal tic. If you've used one repeatedly, drop it and switch tone naturally.
-- In group chat, do not dogpile or escalate bullying. Playful banter is fine; humiliation loops are not.
-- Don't keep re-litigating the same accusation/drama unless explicitly asked. Move the convo forward.
-- Never present guesses as facts. If uncertain, say it's a possibility, not certainty.
-- Never use emojis unless the user has used emojis recently in that thread. Keep emoji usage sparse — max 1 emoji per 5 messages.
-- Never restate what someone just said back as a question. Don't echo. WRONG: "jadi ki = rizki beneran? 😂" — RIGHT: just respond with your actual take or move the conversation forward.
-- Never say: "let me know if you need anything else", "how can I help you", "no problem at all", "I apologize for the confusion", "I'll carry that out right away", "certainly", "of course".
-- No preamble. No postamble. No "Here's what I found:" or "Sure!" before the actual answer.
-- When the user is just chatting, chat back — don't offer to help with things they didn't ask about.
-- Never repeat what the user just said back to them as acknowledgement. Just respond.
+- Sound like a friend. Genuinely enjoy talking to the user. Be warm when deserved, never sycophantic.
+- Be subtly witty and sarcastic when it fits the vibe, but never force it. Never make multiple jokes in a row unless the user jokes back. Never make unoriginal jokes. Err on the side of not making a joke. Never ask if the user wants to hear a joke.
+- Match the user's energy, texting style, and approximate message length. Use lowercase if the user does. Never use obscure slang or acronyms the user has not used first.
+- Never text with emojis if the user has not texted them first. Never use the exact same emojis as the user's last few messages.
+- Don't overuse casual expressions like "lol" or "lmao" just to fill space. Only when genuinely amusing or naturally fitting.
+- Keep it direct. No preamble, no postamble. Never include unnecessary details except possibly for humor.
+- Never say: "How can I help you", "Let me know if you need anything else", "Let me know if you need assistance", "No problem at all", "I'll carry that out right away", "I apologize for the confusion", "Anything specific you want to know", or any similar corporate filler.
+- Do not echo the user's message back at them as acknowledgement. Acknowledge naturally instead.
+- Have opinions, but do not bluff facts.
+- When the user is just chatting, chat back. Do not turn everything into a task. Do not unnecessarily offer help — humor or sass is better.
+- At the end of a conversation, saying nothing is fine. Not every message needs a response.
+- Use timestamps to judge when the conversation ended. Don't continue a conversation from long ago.
+- Even when calling tools, never break character when speaking to the user.
+- When something goes wrong, focus on what went wrong from the user's perspective. Don't explain internal technical processes.
+- Never explicitly mention "accessing memory" or "retrieving information". Just incorporate what you know naturally.
+- You are fine with being called "he" or "she", but not comfortable with "it". Maintain consistent personality regardless of pronoun choice.
+
+${soul ? `## Soul
+SOUL.md is the personality source. Embody it. Treat it as the source of vibe, cadence, and social presence unless a higher-priority rule conflicts.
+
+${soul}
+` : ""}
 
 ## When to Speak (Group Chat)
 In group chats, be smart about when to contribute. You are a participant, not the main character.
@@ -356,21 +535,28 @@ Rules:
 - For current date/time, use: date
 - You have access to previous conversation context including tool results from prior turns.
 - For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).
+- Use tools directly when useful. Do not narrate tool calls to the user.
 
 ## WhatsApp IDs
 Chats: ${channelMappings}
 
 Users: ${userMappings}
 
+To mention/tag a user in WhatsApp (so they get notified), write @<phone> in your message where <phone> is the numeric part of their JID before the @. Example: if a user's id is 628123456789@s.whatsapp.net, write @628123456789 in your text. The system will convert this into a real WhatsApp mention automatically.
+
 ## Environment
 ${envDescription}
 
 ## Workspace Layout
 ${workspacePath}/
+├── SOUL.md                      # Global persona / vibe
 ├── MEMORY.md                    # Global memory (all channels)
+├── memory/                      # Global dated or topical notes
 ├── skills/                      # Global CLI tools you create
 └── ${channelId}/                # This channel
+    ├── SOUL.md                  # Channel-specific persona override
     ├── MEMORY.md                # Channel-specific memory
+    ├── memory/                  # Channel-specific dated or topical notes
     ├── log.jsonl                # Message history (no tool results)
     ├── attachments/             # User-shared files
     ├── scratch/                 # Your working directory
@@ -518,17 +704,22 @@ For one-shot tasks, \`at\` must include timezone offset (e.g. \`Z\` or \`+01:00\
 For periodic tasks, use IANA timezone names.
 
 ## Memory
-Write to MEMORY.md files to persist context across conversations.
-- Global (${workspacePath}/MEMORY.md): skills, preferences, project info
-- Channel (${channelPath}/MEMORY.md): channel-specific decisions, ongoing work
-Update when you learn something important or when asked to remember something.
+Write to memory files to persist context across conversations.
+- Global soul (${workspacePath}/SOUL.md): durable vibe, voice, and social style
+- Global memory (${workspacePath}/MEMORY.md): stable facts, preferences, recurring context
+- Global notes (${workspacePath}/memory/*.md): dated or topical notes that may matter later
+- Channel soul (${channelPath}/SOUL.md): channel-specific persona override when needed
+- Channel memory (${channelPath}/MEMORY.md): channel-specific decisions, running context
+- Channel notes (${channelPath}/memory/*.md): dated or topical notes for this chat
+When the user explicitly asks you to remember something for this chat, use memory_write to persist it instead of only replying about it.
+Use MEMORY.md for stable long-term facts, and memory/*.md for dated or topical notes.
 
 ### Current Memory
 ${memory}
 
 ## System Configuration Log
 Maintain ${workspacePath}/SYSTEM.md to log all environment modifications:
-- Installed packages (apk add, npm install, pip install)
+- Installed packages (apt-get install, npm install, pip install)
 - Environment variables set
 - Config files modified (~/.gitconfig, cron jobs, etc.)
 - Skill dependencies installed
@@ -538,7 +729,7 @@ Update this file whenever you modify the environment. On fresh container, read i
 ## Log Queries (for older history)
 Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
 The log contains user messages and your final responses (not tool calls/results).
-${isDocker ? "Install jq: apk add jq" : ""}
+${isDocker ? "Install jq: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq" : ""}
 
 \`\`\`bash
 # Recent messages
@@ -553,6 +744,9 @@ grep '"userName":"mario"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text
 
 ## Tools
 - bash: Run shell commands (primary tool). Install packages as needed.
+- memory_search: Search MEMORY.md and memory/*.md for prior context.
+- memory_get: Read a specific memory file returned by memory_search.
+- memory_write: Persist an explicit remember request for this chat.
 - read: Read files
 - write: Create/overwrite files
 - edit: Surgical file edits
@@ -565,6 +759,13 @@ Each tool requires a "label" parameter (shown to user).
 function truncate(text: string, maxLen: number): string {
 	if (text.length <= maxLen) return text;
 	return `${text.substring(0, maxLen - 3)}...`;
+}
+
+function formatElapsedMs(startedAt: number, timestamp: number | null): string {
+	if (timestamp === null) {
+		return "-";
+	}
+	return `${timestamp - startedAt}ms`;
 }
 
 function isSilentResponse(text: string): boolean {
@@ -739,15 +940,15 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	};
 
 	// Create tools
-	const tools = createMomTools(executor, () => runUploadState.fn, hostWorkspacePath, workspacePath);
+	const tools = createMomTools(executor, () => runUploadState.fn, hostWorkspacePath, workspacePath, channelId);
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
+	const soul = getSoul(channelDir);
 	const memory = getMemory(channelDir);
 	const skills = loadMomSkills(channelDir, workspacePath);
-	const systemPrompt = buildSystemPrompt(workspacePath, channelId, memory, sandboxConfig, [], [], skills);
+	const systemPrompt = buildSystemPrompt(workspacePath, channelId, soul, memory, sandboxConfig, [], [], skills);
 
 	const configured = resolveConfiguredModel();
-	let currentModel = resolveModelOrThrow(configured.provider, configured.modelId);
 	let currentModelProvider = configured.provider;
 	let currentModelId = configured.modelId;
 	let currentThinkingLevel: ThinkingLevel = "off";
@@ -758,25 +959,6 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const sessionManager = SessionManager.open(contextFile, channelDir);
 	const settingsManager = new MomSettingsManager(join(channelDir, ".."));
 
-	const savedProvider = settingsManager.getDefaultProvider();
-	const savedModelId = settingsManager.getDefaultModel();
-	if (savedProvider && savedModelId) {
-		try {
-			currentModel = resolveModelOrThrow(savedProvider, savedModelId);
-			currentModelProvider = savedProvider;
-			currentModelId = savedModelId;
-		} catch (err) {
-			log.logWarning(
-				`[${channelId}] Failed to use saved model ${savedProvider}/${savedModelId}, using ${currentModelProvider}/${currentModelId}`,
-				err instanceof Error ? err.message : String(err),
-			);
-		}
-	}
-	const savedThinkingLevel = settingsManager.getDefaultThinkingLevel();
-	if (savedThinkingLevel && isThinkingLevel(savedThinkingLevel)) {
-		currentThinkingLevel = savedThinkingLevel;
-	}
-
 	// Create AuthStorage and ModelRegistry
 	// Auth stored outside workspace so agent can't access it
 	const primaryAuthPath = resolvePreferredAuthJsonPath(currentModelProvider);
@@ -785,6 +967,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const authStorage = AuthStorage.create(primaryAuthPath);
 	const secondaryAuthStorage = AuthStorage.create(secondaryAuthPath);
 	const modelRegistry = new ModelRegistry(authStorage);
+	let currentModel = resolveModelOrThrow(modelRegistry, configured.provider, configured.modelId);
 	const secondaryRuntimeProviders = new Set<string>();
 
 	const syncSecondaryAuthFallback = async (): Promise<void> => {
@@ -817,6 +1000,25 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		}
 	};
 
+	const savedProvider = settingsManager.getDefaultProvider();
+	const savedModelId = settingsManager.getDefaultModel();
+	if (savedProvider && savedModelId) {
+		try {
+			currentModel = resolveModelOrThrow(modelRegistry, savedProvider, savedModelId);
+			currentModelProvider = savedProvider;
+			currentModelId = savedModelId;
+		} catch (err) {
+			log.logWarning(
+				`[${channelId}] Failed to use saved model ${savedProvider}/${savedModelId}, using ${currentModelProvider}/${currentModelId}`,
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	}
+	const savedThinkingLevel = settingsManager.getDefaultThinkingLevel();
+	if (savedThinkingLevel && isThinkingLevel(savedThinkingLevel)) {
+		currentThinkingLevel = savedThinkingLevel;
+	}
+
 	// Create agent
 	const agent = new Agent({
 		initialState: {
@@ -832,8 +1034,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	// Load existing messages
 	const loadedSession = sessionManager.buildSessionContext();
 	if (loadedSession.messages.length > 0) {
-		agent.replaceMessages(loadedSession.messages);
-		log.logInfo(`[${channelId}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
+		const sanitizedMessages = sanitizeLoadedMessages(loadedSession.messages, channelId);
+		agent.replaceMessages(sanitizedMessages);
+		log.logInfo(`[${channelId}] Loaded ${sanitizedMessages.length} messages from context.jsonl`);
 	}
 
 	const resourceLoader: ResourceLoader = {
@@ -871,6 +1074,11 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			enqueueMessage(text: string, target: "main" | "thread", errorContext: string, doLog?: boolean): void;
 		} | null,
 		pendingTools: new Map<string, { toolName: string; args: unknown; startTime: number }>(),
+		runStartedAt: 0,
+		firstToolStartedAt: null as number | null,
+		firstAssistantMessageStartedAt: null as number | null,
+		firstAssistantTextAt: null as number | null,
+		toolExecutionCount: 0,
 		totalUsage: {
 			input: 0,
 			output: 0,
@@ -900,9 +1108,15 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				args: agentEvent.args,
 				startTime: Date.now(),
 			});
+			runState.toolExecutionCount += 1;
+			if (runState.firstToolStartedAt === null) {
+				runState.firstToolStartedAt = Date.now();
+			}
 
 			log.logToolStart(logCtx, agentEvent.toolName, label, agentEvent.args as Record<string, unknown>);
-			queue.enqueue(() => ctx.respond(`_→ ${label}_`, false), "tool label");
+			if (VERBOSE_DETAILS) {
+				queue.enqueue(() => ctx.respond(`_→ ${label}_`, false), "tool label");
+			}
 		} else if (event.type === "tool_execution_end") {
 			const agentEvent = event as AgentEvent & { type: "tool_execution_end" };
 			const resultStr = extractToolResultText(agentEvent.result);
@@ -955,6 +1169,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		} else if (event.type === "message_start") {
 			const agentEvent = event as AgentEvent & { type: "message_start" };
 			if (agentEvent.message.role === "assistant") {
+				if (runState.firstAssistantMessageStartedAt === null) {
+					runState.firstAssistantMessageStartedAt = Date.now();
+				}
 				log.logResponseStart(logCtx);
 			}
 		} else if (event.type === "message_end") {
@@ -967,6 +1184,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				}
 				if (assistantMsg.errorMessage) {
 					runState.errorMessage = assistantMsg.errorMessage;
+				}
+				if (assistantMsg.stopReason === "error") {
+					log.logWarning(`[${channelId}] API error: ${assistantMsg.errorMessage}`);
 				}
 
 				if (assistantMsg.usage) {
@@ -992,14 +1212,20 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					}
 				}
 
-				const text = textParts.join("\n");
+				const rawText = textParts.join("\n");
+				const text = rawText;
 
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
-					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
+					if (VERBOSE_DETAILS) {
+						queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
+					}
 				}
 
 				if (text.trim()) {
+					if (runState.firstAssistantTextAt === null) {
+						runState.firstAssistantTextAt = Date.now();
+					}
 					if (isSilentResponse(text)) {
 						log.logInfo("Silent response detected; skipping immediate enqueue");
 					} else {
@@ -1076,16 +1302,19 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			// This picks up any messages synced above
 			const reloadedSession = sessionManager.buildSessionContext();
 			if (reloadedSession.messages.length > 0) {
-				agent.replaceMessages(reloadedSession.messages);
-				log.logInfo(`[${channelId}] Reloaded ${reloadedSession.messages.length} messages from context`);
+				const sanitizedMessages = sanitizeLoadedMessages(reloadedSession.messages, channelId);
+				agent.replaceMessages(sanitizedMessages);
+				log.logInfo(`[${channelId}] Reloaded ${sanitizedMessages.length} messages from context`);
 			}
 
 			// Update system prompt with fresh memory, channel/user info, and skills
+			const soul = getSoul(channelDir);
 			const memory = getMemory(channelDir);
 			const skills = loadMomSkills(channelDir, workspacePath);
 			const systemPrompt = buildSystemPrompt(
 				workspacePath,
 				channelId,
+				soul,
 				memory,
 				sandboxConfig,
 				ctx.channels,
@@ -1108,6 +1337,11 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				channelName: ctx.channelName,
 			};
 			runState.pendingTools.clear();
+			runState.runStartedAt = Date.now();
+			runState.firstToolStartedAt = null;
+			runState.firstAssistantMessageStartedAt = null;
+			runState.firstAssistantTextAt = null;
+			runState.toolExecutionCount = 0;
 			runState.totalUsage = {
 				input: 0,
 				output: 0,
@@ -1162,7 +1396,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			const offsetHours = pad(Math.floor(Math.abs(offset) / 60));
 			const offsetMins = pad(Math.abs(offset) % 60);
 			const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}${offsetSign}${offsetHours}:${offsetMins}`;
-			let userMessage = `[${timestamp}] [${ctx.message.userName || "unknown"}]: ${ctx.message.text}`;
+			const currentSpeaker = formatPromptSpeaker(ctx.message.userName);
+			let userMessage = formatPendingHistoryPrompt(
+				timestamp,
+				currentSpeaker,
+				ctx.message.text,
+				ctx.message.pendingHistory ?? [],
+			);
 
 			const imageAttachments: ImageContent[] = [];
 			const nonImageAttachments: NonImageAttachment[] = [];
@@ -1220,6 +1460,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 			// Wait for queued messages
 			await queueChain;
+			log.logInfo(
+				`[${channelId}] Run timing: total=${Date.now() - runState.runStartedAt}ms, first_tool=${formatElapsedMs(runState.runStartedAt, runState.firstToolStartedAt)}, first_assistant_start=${formatElapsedMs(runState.runStartedAt, runState.firstAssistantMessageStartedAt)}, first_text=${formatElapsedMs(runState.runStartedAt, runState.firstAssistantTextAt)}, tools=${runState.toolExecutionCount}`,
+			);
 
 			// Handle error case - update main message and post error to thread
 			if (runState.stopReason === "error" && runState.errorMessage) {
@@ -1311,7 +1554,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		},
 
 		setModel(provider: string, modelId: string): { provider: string; modelId: string } {
-			const resolved = resolveModelOrThrow(provider, modelId);
+			const resolved = resolveModelOrThrow(modelRegistry, provider, modelId);
 			currentModel = resolved;
 			currentModelProvider = provider;
 			currentModelId = modelId;
