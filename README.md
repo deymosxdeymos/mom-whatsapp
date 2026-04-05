@@ -43,7 +43,7 @@ export MOM_WA_ASSISTANT_HAS_OWN_NUMBER=1
 # Optional: model override (default: anthropic/claude-sonnet-4-6)
 export MOM_WA_MODEL=anthropic/claude-sonnet-4-6
 # Optional: phone-number pairing for auth setup
-# (used by `npm run wa:auth`, not by the runtime process)
+# (used by the auth helper command, not by the runtime process)
 export MOM_WA_PAIRING_PHONE=14155551234
 
 # Option 1: Anthropic key
@@ -54,13 +54,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # Optional fallback path: ~/.pi/mom-whatsapp/auth.json
 
 # Authenticate once (QR by default, or pairing-code if MOM_WA_PAIRING_PHONE is set)
-npm run wa:auth
+AUTH_HELPER="$(npm root -g)/@deymosxdeymos/pi-mom-whatsapp/dist/whatsapp-auth.js"
+node "$AUTH_HELPER"
 
 # Recommended: run with Docker sandbox
 mom-whatsapp --sandbox=docker:mom-sandbox ./data
 ```
 
-Runtime no longer performs QR/pairing setup. Authenticate first with `npm run wa:auth`.
+Runtime no longer performs QR/pairing setup. Authenticate first with the auth helper command above.
 
 ## Triggering Behavior
 
@@ -77,6 +78,8 @@ Use text commands in DM/group chats:
 
 - `!help` - list available commands
 - `!stop` - stop active run in this chat (`/stop` and plain `stop` also work)
+- `!status` - show current runtime status (connection, sandbox, model, queue, artifacts URL)
+- `!providers` - list available providers/models (`!models` also works)
 - `!model` - show current model
 - `!model <provider/model-id>` - set default model for future runs in this workspace
 - `!model gpt-5.4` - alias for `openai-codex/gpt-5.4`
@@ -112,7 +115,7 @@ Use text commands in DM/group chats:
 
 `/` prefix is also accepted (for example `/help`).
 
-If `MOM_WA_OWNER_JIDS` is set, privileged commands are restricted to those JIDs.
+If `MOM_WA_OWNER_JIDS` is set, privileged commands are restricted to those JIDs (for example: model/thinking changes, global memory/soul/notes writes, task create/pause/resume/cancel, and session reset).
 The adapter also adds lightweight status reactions on incoming command messages: ⏳ (start), ✅ (success), ❌ (error), ⏹️ (aborted).
 
 ## Agent IPC
@@ -159,7 +162,13 @@ If the configured model/API key is available, mom-whatsapp first parses the expo
 Authentication helper:
 
 ```bash
-npm run wa:auth                    # QR mode
+# Global install
+AUTH_HELPER="$(npm root -g)/@deymosxdeymos/pi-mom-whatsapp/dist/whatsapp-auth.js"
+node "$AUTH_HELPER"                                    # QR mode
+node "$AUTH_HELPER" --pairing-code --phone 14155551234
+
+# Repo checkout alternative
+npm run wa:auth
 npm run wa:auth -- --pairing-code --phone 14155551234
 ```
 
@@ -172,13 +181,19 @@ npm run wa:auth -- --pairing-code --phone 14155551234
 | `MOM_WA_GROUP_TRIGGER_ALIASES` | no | CSV extra trigger tokens for groups (e.g. `jang,bro`) |
 | `MOM_WA_ALLOWED_GROUPS` | no | CSV allowlist of group JIDs and/or group name fragments |
 | `MOM_WA_VERBOSE_DETAILS` | no | `1` to emit tool detail stream to chat, default off |
+| `MOM_WA_TIMEZONE` | no | Default process timezone (used for task scheduling/display). Defaults to `Asia/Jakarta` when `TZ` is unset |
+| `MOM_WA_RUN_TIMEOUT_MS` | no | Per-run timeout in milliseconds (default `600000`) |
+| `MOM_WA_BUBBLE_DELAY` | no | Set `0` to disable simulated typing delay between bubbles (default enabled) |
+| `MOM_WA_BUBBLE_DELAY_PER_CHAR_MS` | no | Typing delay slope per character (default `10`) |
+| `MOM_WA_BUBBLE_DELAY_MIN_MS` | no | Minimum typing delay per bubble (default `80`) |
+| `MOM_WA_BUBBLE_DELAY_MAX_MS` | no | Maximum typing delay per bubble (default `600`) |
 | `MOM_WA_ARTIFACTS_BASE_URL` | no | Public base URL for artifact links (e.g. Cloudflare Tunnel URL) |
 | `MOM_WA_ARTIFACTS_URL_FILE` | no | File containing base URL (default `/tmp/artifacts-url.txt`) |
 | `MOM_WA_ARTIFACTS_ROOT` | no | Artifact root directory (default `<working-dir>/artifacts/files`) |
 | `MOM_WA_ASSISTANT_HAS_OWN_NUMBER` | no | `0` for shared-number setups (bot prefixes outbound text with bot name) |
 | `MOM_WA_MODEL` | no | Default model override, e.g. `anthropic/claude-sonnet-4-6`, `gpt-5.4`, or `fireworks/kimi-k2.5-turbo` |
-| `MOM_WA_OWNER_JIDS` | no | Comma-separated owner JIDs allowed to run privileged chat commands (`!model`, `!thinking`, global memory writes) |
-| `MOM_WA_PAIRING_PHONE` | no | Optional phone number for `npm run wa:auth` pairing-code mode (digits only, e.g. `14155551234`) |
+| `MOM_WA_OWNER_JIDS` | no | Comma-separated owner JIDs allowed to run privileged chat commands (model/thinking changes, global writes, task mutations, session reset) |
+| `MOM_WA_PAIRING_PHONE` | no | Optional phone number for auth helper pairing-code mode (digits only, e.g. `14155551234`) |
 | `ANTHROPIC_API_KEY` | no* | API key if not using `auth.json` |
 
 ## Workspace Layout
@@ -237,13 +252,13 @@ If validation fails, startup exits with `SANDBOX_MOUNT_NOT_ALLOWED` and prints t
 
 ## Troubleshooting
 
-- **QR keeps reappearing / not persisted**: run `npm run wa:auth` again and verify `MOM_WA_AUTH_DIR` is stable/writable.
-- **No QR appears / repeated `Connection Failure` during auth**: set `MOM_WA_PAIRING_PHONE` and run `npm run wa:auth` for phone-number pairing mode.
+- **QR keeps reappearing / not persisted**: run the auth helper again and verify `MOM_WA_AUTH_DIR` is stable/writable.
+- **No QR appears / repeated `Connection Failure` during auth**: set `MOM_WA_PAIRING_PHONE` and run auth helper with `--pairing-code`.
 - **No response in group**: verify bot name mention + allowlist match (`MOM_WA_ALLOWED_GROUPS`).
 - **Messages delayed after reconnect**: queued outbound messages flush automatically after connection opens.
 - **`Permission denied` when writing `/workspace/...` in Docker sandbox**: recreate sandbox container with `./docker.sh remove && ./docker.sh create ./data` (scripts use `--security-opt label=disable` for SELinux hosts).
 - **Shared-number loops**: set `MOM_WA_ASSISTANT_HAS_OWN_NUMBER=0`.
-- **Logged out event**: run `npm run wa:auth` again, then restart `mom-whatsapp`.
+- **Logged out event**: run the auth helper again, then restart `mom-whatsapp`.
 
 ## Development
 
@@ -256,7 +271,7 @@ Helper scripts:
 Runtime checklist output:
 
 - Prints strict PASS/FAIL for startup/auth, DM stop flow, group allowlist behavior, shared-number loop prevention, media ingestion, reconnect queue flush, verbose detail toggle, events, and Docker sandbox persistence.
-- Saves JSON evidence to `packages/mom-whatsapp/runtime-checklist/report-<timestamp>.json`.
+- Saves JSON evidence to `<current-working-dir>/runtime-checklist/report-<timestamp>.json`.
 - Note: this harness uses a deterministic fake WhatsApp socket + real events/sandbox execution; run a live phone/QR pass separately before production use.
 
 Key files:
