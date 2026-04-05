@@ -18,7 +18,7 @@ A WhatsApp bot powered by pi's coding-agent runtime. It executes bash/read/write
 ## Installation
 
 ```bash
-npm install @mariozechner/pi-mom-whatsapp
+npm install -g @deymosxdeymos/pi-mom-whatsapp
 ```
 
 ## Quick Start

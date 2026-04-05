@@ -4,7 +4,7 @@
 
 ### Added
 
-- Initial WhatsApp transport package `@mariozechner/pi-mom-whatsapp` with Baileys-based connectivity.
+- Initial WhatsApp transport package `@deymosxdeymos/pi-mom-whatsapp` with Baileys-based connectivity.
 - Per-chat agent runtime with persistent `log.jsonl` + `context.jsonl` state, memory files, skills, and event scheduling.
 - WhatsApp media ingestion: inbound image/video/document attachments are downloaded into `<chat>/attachments/` and included in prompt context.
 - Group allowlist matching by exact JID and group-name substring (`MOM_WA_ALLOWED_GROUPS`).

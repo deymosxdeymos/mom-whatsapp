@@ -1,5 +1,5 @@
 {
-	"name": "@mariozechner/pi-mom-whatsapp",
+	"name": "@deymosxdeymos/pi-mom-whatsapp",
 	"version": "0.54.1",
 	"description": "WhatsApp bot that delegates messages to the pi coding agent",
 	"type": "module",
@@ -14,8 +14,8 @@
 	],
 	"scripts": {
 		"clean": "rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json && chmod +x dist/main.js",
-		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"build": "tsc -p tsconfig.build.json && chmod +x dist/main.js",
+		"dev": "tsc -p tsconfig.build.json --watch --preserveWatchOutput",
 		"test": "rm -rf dist-test && tsc -p tsconfig.test.json && node --test dist-test/*.test.js dist-test/**/*.test.js",
 		"typecheck": "tsc -p tsconfig.build.json --noEmit",
 		"check": "npm run typecheck",
