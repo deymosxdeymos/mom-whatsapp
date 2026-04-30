@@ -7,7 +7,7 @@ import { ChannelStore } from "../src/store.ts";
 import type { BotContext } from "../src/whatsapp.ts";
 
 const workspaceDir = "/home/deymos/clones/mom-whatsapp/live-data";
-const sourceChannel = "contact-a@s.whatsapp.net";
+const sourceChannel = "bench-source@s.whatsapp.net";
 const sourceDir = join(workspaceDir, sourceChannel);
 const ts = Date.now();
 const largeChannel = `bench-large-${ts}`;
