@@ -16,7 +16,7 @@ import { createEventsWatcher } from "./events.js";
 import { createIpcWatcher, parseIpcMessage } from "./ipc.js";
 import { createExecutor, parseSandboxArg, validateSandbox } from "./sandbox.js";
 import { ChannelStore } from "./store.js";
-import { formatVerboseDetailsMessage } from "./verbose.js";
+import { formatVerboseDetailsMessage } from "./render/index.js";
 import { type MomHandler, WhatsAppBot, type WhatsAppDependencies, type WhatsAppEvent } from "./whatsapp.js";
 
 interface ChecklistResult {

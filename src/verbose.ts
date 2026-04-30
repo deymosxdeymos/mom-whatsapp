@@ -1,6 +1,2 @@
-export function formatVerboseDetailsMessage(text: string, verboseEnabled: boolean): string | null {
-	if (!verboseEnabled) {
-		return null;
-	}
-	return `[details]\n${text}`;
-}
+// Re-export from render/format.ts for backward compatibility.
+export { formatVerboseDetailsMessage } from "./render/index.js";

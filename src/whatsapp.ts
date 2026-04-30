@@ -14,9 +14,34 @@ import { existsSync, mkdirSync, readFileSync } from "fs";
 import { open, writeFile } from "fs/promises";
 import { basename, extname, join } from "path";
 import { appendGroupHistoryEntry, loadGroupHistory, type GroupHistoryEntry } from "./group-history.js";
+import { IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, mimeFromExtension } from "./attachments.js";
+import { isFileNotFoundError, isStopCommandText, sleep } from "./control-commands.js";
 import { normalizeWhatsAppJid } from "./jid.js";
 import * as log from "./log.js";
 import type { Attachment, ChannelStore } from "./store.js";
+import {
+	detectAttachmentFilename,
+	extractText,
+	getContextInfos,
+	timestampToMs,
+} from "./whatsapp/message-parsing.js";
+import {
+	getGroupTriggerTokens,
+	isBotAuthoredMessage,
+	isGroupAllowed,
+	isMentioned,
+	isReplyToBotByStanzaId,
+	stripMention,
+} from "./whatsapp/triggers.js";
+import type {
+	BotContext,
+	ChannelInfo,
+	MomHandler,
+	UserInfo,
+	WhatsAppChannel,
+	WhatsAppEvent,
+	WhatsAppUser,
+} from "./whatsapp/types.js";
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_OUTGOING_QUEUE = 200;
@@ -25,70 +50,16 @@ const BOT_LOG_TAIL_BYTES = 128 * 1024;
 const BOT_LOG_CACHE_MAX_IDS_PER_CHANNEL = 2000;
 const MOM_WA_DEBUG_INCOMING = process.env.MOM_WA_DEBUG_INCOMING === "1";
 
-export interface WhatsAppEvent {
-	type: "mention" | "dm";
-	source: "whatsapp" | "scheduled";
-	channel: string;
-	ts: string;
-	user: string;
-	text: string;
-	rawText: string;
-	pendingHistory?: GroupHistoryEntry[];
-	attachments?: Attachment[];
-	messageKey?: proto.IMessageKey;
-}
-
-export interface WhatsAppUser {
-	id: string;
-	userName: string;
-	displayName: string;
-}
-
-export interface WhatsAppChannel {
-	id: string;
-	name: string;
-}
-
-export interface ChannelInfo {
-	id: string;
-	name: string;
-}
-
-export interface UserInfo {
-	id: string;
-	userName: string;
-	displayName: string;
-}
-
-export interface BotContext {
-	message: {
-		text: string;
-		rawText: string;
-		user: string;
-		userName?: string;
-		channel: string;
-		ts: string;
-		pendingHistory?: GroupHistoryEntry[];
-		attachments: Array<{ local: string }>;
-	};
-	channelName?: string;
-	channels: ChannelInfo[];
-	users: UserInfo[];
-	respond: (text: string, shouldLog?: boolean) => Promise<void>;
-	replaceMessage: (text: string) => Promise<void>;
-	respondInThread: (text: string) => Promise<void>;
-	setTyping: (isTyping: boolean) => Promise<void>;
-	uploadFile: (filePath: string, title?: string) => Promise<void>;
-	setWorking: (working: boolean) => Promise<void>;
-	deleteMessage: () => Promise<void>;
-	markToolExecution?: () => void;
-}
-
-export interface MomHandler {
-	isRunning(channelId: string): boolean;
-	handleEvent(event: WhatsAppEvent, wa: WhatsAppBot, isEvent?: boolean): Promise<void>;
-	handleStop(channelId: string, wa: WhatsAppBot): Promise<void>;
-}
+// Re-export types for backward compatibility.
+export type {
+	BotContext,
+	ChannelInfo,
+	MomHandler,
+	UserInfo,
+	WhatsAppChannel,
+	WhatsAppEvent,
+	WhatsAppUser,
+} from "./whatsapp/types.js";
 
 type QueuedWork = () => Promise<void>;
 
@@ -155,8 +126,6 @@ interface LIDResolver {
 	};
 }
 
-const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
-const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".m4v"]);
 
 function createWhatsAppDependencies(overrides?: Partial<WhatsAppDependencies>): WhatsAppDependencies {
 	const defaults: WhatsAppDependencies = {
@@ -334,12 +303,12 @@ export class WhatsAppBot {
 		const senderRaw = msg.key.participant || msg.key.remoteJid;
 		const sender = normalizeWhatsAppJid(await this.translateJid(senderRaw));
 		const userName = msg.pushName || sender.split("@")[0];
-		const text = this.extractText(msg.message);
-		const tsMs = this.timestampToMs(msg.messageTimestamp);
+		const text = extractText(msg.message);
+		const tsMs = timestampToMs(msg.messageTimestamp);
 		const fromMe = msg.key.fromMe || false;
 
 		if (this.config.assistantHasOwnNumber && fromMe) return;
-		if (this.isBotAuthoredMessage(fromMe, text)) return;
+		if (isBotAuthoredMessage(this.config, fromMe, text)) return;
 
 		this.users.set(sender, { id: sender, userName, displayName: userName });
 		if (!this.channels.has(channelId)) {
@@ -349,12 +318,12 @@ export class WhatsAppBot {
 
 		const isDm = channelId.endsWith("@s.whatsapp.net");
 		if (!isDm && !channelId.endsWith("@g.us")) return;
-		if (!isDm && !this.isGroupAllowed(channelId)) return;
+		if (!isDm && !isGroupAllowed(channelId, this.config.allowedGroups, this.channels)) return;
 
-		const cleanedText = isDm ? text.trim() : this.stripMention(text, msg.message).trim();
-		const stopRequested = this.isStopCommandText(cleanedText || text);
+		const cleanedText = isDm ? text.trim() : stripMention(getGroupTriggerTokens(this.config), this.botJids, text, msg.message).trim();
+		const stopRequested = isStopCommandText(cleanedText || text);
 
-		const mentioned = this.isMentioned(text, msg.message);
+		const mentioned = isMentioned(getGroupTriggerTokens(this.config), this.botJids, text, msg.message);
 		const repliedToBot = await this.isReplyToBotMessage(channelId, msg.message);
 		const botTriggered = isDm || mentioned || repliedToBot || (stopRequested && this.handler.isRunning(channelId));
 		if (MOM_WA_DEBUG_INCOMING && !isDm) {
@@ -443,22 +412,6 @@ export class WhatsAppBot {
 			attachments: event.attachments || [],
 			isBot: false,
 		});
-	}
-
-	private isGroupAllowed(channelId: string): boolean {
-		if (this.config.allowedGroups.length === 0) return true;
-		const channelName = this.channels.get(channelId)?.name.toLowerCase() || "";
-		return this.config.allowedGroups.some((allowed) => {
-			const value = allowed.toLowerCase();
-			return value === channelId.toLowerCase() || (channelName.length > 0 && channelName.includes(value));
-		});
-	}
-
-	private isBotAuthoredMessage(fromMe: boolean, text: string): boolean {
-		if (this.config.assistantHasOwnNumber) return fromMe;
-		if (!fromMe) return false;
-		const normalized = text.trim().toLowerCase();
-		return normalized.startsWith(`${this.config.botName.toLowerCase()}:`);
 	}
 
 	private isRecentOutboundMessageId(messageId: string | null | undefined): boolean {
@@ -568,92 +521,11 @@ export class WhatsAppBot {
 		}
 	}
 
-	private isMentioned(text: string, message: proto.IMessage | null | undefined): boolean {
-		for (const trigger of this.getGroupTriggerTokens()) {
-			const mentionRegex = new RegExp(`(?:^|\\s)@?${escapeRegex(trigger)}(?:\\b|\\s|$)`, "i");
-			if (mentionRegex.test(text)) return true;
-		}
-		const mentionedJids = this.getMentionedJids(message);
-		return mentionedJids.some((jid) => this.botJids.has(normalizeWhatsAppJid(jid)));
-	}
-
-	private isStopCommandText(text: string): boolean {
-		const normalized = text.trim().toLowerCase();
-		return normalized === "stop" || normalized === "!stop" || normalized === "/stop";
-	}
-
-	private stripMention(text: string, message: proto.IMessage | null | undefined): string {
-		let stripped = text;
-		for (const trigger of this.getGroupTriggerTokens()) {
-			stripped = stripped.replace(new RegExp(`(?:^|\\s)@?${escapeRegex(trigger)}(?:\\b|\\s|$)`, "ig"), " ");
-		}
-
-		const mentionedJids = this.getMentionedJids(message);
-		const botMentionedByJid = mentionedJids.some((jid) => this.botJids.has(normalizeWhatsAppJid(jid)));
-		if (botMentionedByJid) {
-			for (const botJid of this.botJids) {
-				const alias = this.extractJidUserPart(botJid);
-				if (!alias) continue;
-				stripped = stripped.replace(new RegExp(`(?:^|\\s)@?${escapeRegex(alias)}(?:\\b|\\s|$)`, "ig"), " ");
-			}
-		}
-
-		return stripped.replace(/\s+/g, " ").trim();
-	}
-
-	private extractJidUserPart(jid: string): string {
-		const [userPart = ""] = jid.split("@", 1);
-		const [baseUser = ""] = userPart.split(":", 1);
-		return baseUser;
-	}
-
-	private getGroupTriggerTokens(): string[] {
-		const aliases = this.config.groupTriggerAliases || [];
-		const deduped = new Set<string>();
-		for (const token of [this.config.botName, ...aliases]) {
-			const normalized = token.trim();
-			if (!normalized) continue;
-			deduped.add(normalized);
-		}
-		return Array.from(deduped);
-	}
-
-	private getContextInfos(message: proto.IMessage | null | undefined): Array<proto.IContextInfo | null | undefined> {
-		const normalized = normalizeMessageContent(message) || message;
-		if (!normalized) return [];
-		return [
-			normalized.extendedTextMessage?.contextInfo,
-			normalized.imageMessage?.contextInfo,
-			normalized.videoMessage?.contextInfo,
-			normalized.documentMessage?.contextInfo,
-		];
-	}
-
-	private getMentionedJids(message: proto.IMessage | null | undefined): string[] {
-		const all: string[] = [];
-		for (const info of this.getContextInfos(message)) {
-			if (!info?.mentionedJid) continue;
-			all.push(...info.mentionedJid);
-		}
-		return all;
-	}
-
 	private async isReplyToBotMessage(channelId: string, message: proto.IMessage | null | undefined): Promise<boolean> {
-		for (const info of this.getContextInfos(message)) {
-			const stanzaId = info?.stanzaId;
-			if (stanzaId && this.isRecentOutboundMessageId(stanzaId)) {
-				return true;
-			}
-
-			const participant = info?.participant;
-			if (participant && this.botJids.has(normalizeWhatsAppJid(participant))) {
-				return true;
-			}
-
-			if (stanzaId && (await this.wasBotMessageLogged(channelId, stanzaId))) {
-				return true;
-			}
-		}
+		const { byStanzaId, byParticipant } = isReplyToBotByStanzaId(getContextInfos(message), this.botJids);
+		if (byParticipant) return true;
+		if (byStanzaId && this.isRecentOutboundMessageId(byStanzaId)) return true;
+		if (byStanzaId && (await this.wasBotMessageLogged(channelId, byStanzaId))) return true;
 		return false;
 	}
 
@@ -665,45 +537,6 @@ export class WhatsAppBot {
 
 		await this.ensureBotLogCacheLoaded(channelId);
 		return this.botLoggedMessageIds.get(channelId)?.has(messageId) ?? false;
-	}
-
-	private extractText(message: proto.IMessage | null | undefined): string {
-		const normalized = normalizeMessageContent(message) || message;
-		if (!normalized) return "";
-		if (normalized.conversation) return normalized.conversation;
-		if (normalized.extendedTextMessage?.text) return normalized.extendedTextMessage.text;
-		if (normalized.imageMessage?.caption) return normalized.imageMessage.caption;
-		if (normalized.videoMessage?.caption) return normalized.videoMessage.caption;
-		if (normalized.documentMessage?.caption) return normalized.documentMessage.caption;
-		return "";
-	}
-
-	private timestampToMs(ts: unknown): number {
-		if (!ts) return Date.now();
-		if (typeof ts === "number") return ts * 1000;
-		if (typeof ts === "bigint") return Number(ts) * 1000;
-		if (typeof ts === "object" && ts !== null) {
-			const stringLike = ts as { toString?: () => string };
-			if (typeof stringLike.toString === "function") {
-				const secondsFromString = Number(stringLike.toString());
-				if (Number.isFinite(secondsFromString)) {
-					return secondsFromString * 1000;
-				}
-			}
-
-			const longParts = ts as { low?: unknown; high?: unknown; unsigned?: unknown };
-			if (typeof longParts.low === "number" && typeof longParts.high === "number") {
-				const low = BigInt(longParts.low >>> 0);
-				const high = BigInt(longParts.high >>> 0);
-				const value = (high << 32n) | low;
-				const signedValue = longParts.unsigned === true ? value : BigInt.asIntN(64, value);
-				const secondsFromParts = Number(signedValue);
-				if (Number.isFinite(secondsFromParts)) {
-					return secondsFromParts * 1000;
-				}
-			}
-		}
-		return Date.now();
 	}
 
 	private async getGroupName(channelId: string): Promise<string> {
@@ -795,7 +628,7 @@ export class WhatsAppBot {
 			normalizedMessage?.imageMessage?.mimetype ||
 			normalizedMessage?.videoMessage?.mimetype ||
 			"unknown";
-		const originalFileName = normalizedMessage?.documentMessage?.fileName || this.detectAttachmentFilename(normalizedMsg);
+		const originalFileName = normalizedMessage?.documentMessage?.fileName || detectAttachmentFilename(normalizedMsg);
 		log.logInfo(
 			`[${channelId}] Incoming WhatsApp media: type=${mediaType} mimetype=${mimeType} filename=${JSON.stringify(originalFileName)} messageId=${msg.key?.id || "unknown"}`,
 		);
@@ -803,7 +636,7 @@ export class WhatsAppBot {
 		try {
 			const buffer = await this.deps.downloadMedia(normalizedMsg, this.sock);
 
-			const fileNameWithExt = this.detectAttachmentFilename(normalizedMsg);
+			const fileNameWithExt = detectAttachmentFilename(normalizedMsg);
 			const timestampSeconds = (timestampMs / 1000).toString();
 			const localFileName = this.config.store.generateLocalFilename(fileNameWithExt, timestampSeconds);
 			const localPath = `${channelId}/attachments/${localFileName}`;
@@ -822,24 +655,6 @@ export class WhatsAppBot {
 			);
 			return [];
 		}
-	}
-
-	private detectAttachmentFilename(msg: WAMessage): string {
-		const normalizedMessage = normalizeMessageContent(msg.message) || msg.message;
-		const documentName = normalizedMessage?.documentMessage?.fileName;
-		if (documentName) return documentName;
-
-		if (normalizedMessage?.imageMessage?.mimetype) {
-			return `image${extensionFromMime(normalizedMessage.imageMessage.mimetype)}`;
-		}
-		if (normalizedMessage?.videoMessage?.mimetype) {
-			return `video${extensionFromMime(normalizedMessage.videoMessage.mimetype)}`;
-		}
-		if (normalizedMessage?.documentMessage?.mimetype) {
-			return `document${extensionFromMime(normalizedMessage.documentMessage.mimetype)}`;
-		}
-
-		return "attachment.bin";
 	}
 
 	private getQueue(channelId: string): ChannelQueue {
@@ -1114,38 +929,3 @@ export class WhatsAppBot {
 	}
 }
 
-function mimeFromExtension(ext: string): string {
-	if (ext === ".pdf") return "application/pdf";
-	if (ext === ".txt") return "text/plain";
-	if (ext === ".json") return "application/json";
-	if (ext === ".csv") return "text/csv";
-	if (ext === ".zip") return "application/zip";
-	if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-	if (ext === ".png") return "image/png";
-	if (ext === ".gif") return "image/gif";
-	if (ext === ".webp") return "image/webp";
-	if (ext === ".mp4") return "video/mp4";
-	return "application/octet-stream";
-}
-
-function extensionFromMime(mime: string): string {
-	if (mime === "image/jpeg") return ".jpg";
-	if (mime === "image/png") return ".png";
-	if (mime === "image/gif") return ".gif";
-	if (mime === "image/webp") return ".webp";
-	if (mime === "application/pdf") return ".pdf";
-	if (mime === "video/mp4") return ".mp4";
-	return ".bin";
-}
-
-function escapeRegex(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function isFileNotFoundError(err: unknown): boolean {
-	return typeof err === "object" && err !== null && "code" in err && (err as { code?: string }).code === "ENOENT";
-}

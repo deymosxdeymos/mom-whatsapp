@@ -34,19 +34,13 @@ import {
 } from "./tasks.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "./sandbox.js";
 import { ChannelStore } from "./store.js";
-import { formatVerboseDetailsMessage } from "./verbose.js";
+import { formatVerboseDetailsMessage, splitIntoBubbles, typingDelayMs } from "./render/index.js";
 import { type MomHandler, type WhatsAppBot, WhatsAppBot as WhatsAppBotClass, type WhatsAppEvent } from "./whatsapp.js";
 import {
 	ensureWorkspaceBootstrapFiles,
 } from "./workspace-files.js";
 import { handleWorkspaceCommand } from "./workspace-commands.js";
-
-function readNumberEnv(name: string, fallback: number): number {
-	const value = process.env[name];
-	if (!value) return fallback;
-	const parsed = Number(value);
-	return Number.isFinite(parsed) ? parsed : fallback;
-}
+import { sleep } from "./control-commands.js";
 
 const MOM_WA_AUTH_DIR = process.env.MOM_WA_AUTH_DIR;
 const MOM_WA_BOT_NAME = process.env.MOM_WA_BOT_NAME || "ujang";
@@ -58,13 +52,6 @@ const MOM_WA_GROUP_TRIGGER_ALIASES = (process.env.MOM_WA_GROUP_TRIGGER_ALIASES |
 const MOM_WA_VERBOSE_DETAILS = process.env.MOM_WA_VERBOSE_DETAILS === "1";
 const MOM_WA_ASSISTANT_HAS_OWN_NUMBER = process.env.MOM_WA_ASSISTANT_HAS_OWN_NUMBER !== "0";
 const MOM_WA_RUN_TIMEOUT_MS = Number(process.env.MOM_WA_RUN_TIMEOUT_MS) || 10 * 60 * 1000; // 10 min default
-const MOM_WA_BUBBLE_DELAY_ENABLED = process.env.MOM_WA_BUBBLE_DELAY !== "0";
-const MOM_WA_BUBBLE_DELAY_PER_CHAR_MS = Math.max(0, readNumberEnv("MOM_WA_BUBBLE_DELAY_PER_CHAR_MS", 10));
-const MOM_WA_BUBBLE_DELAY_MIN_MS = Math.max(0, readNumberEnv("MOM_WA_BUBBLE_DELAY_MIN_MS", 80));
-const MOM_WA_BUBBLE_DELAY_MAX_MS = Math.max(
-	MOM_WA_BUBBLE_DELAY_MIN_MS,
-	readNumberEnv("MOM_WA_BUBBLE_DELAY_MAX_MS", 600),
-);
 
 const RUN_MAX_RETRIES = 3;
 const RUN_BASE_RETRY_MS = 5000; // 5s → 10s → 20s
@@ -208,40 +195,6 @@ function isOwnerJid(jid: string): boolean {
 function truncateText(text: string, maxLen: number): string {
 	if (text.length <= maxLen) return text;
 	return `${text.slice(0, maxLen - 3)}...`;
-}
-
-// Split a response into chat bubbles.
-// Primary: \n---\n explicit separator the model is instructed to use.
-// Fallback: \n\n paragraph breaks — catches cases where the model uses
-// natural paragraphs instead of the explicit separator.
-function splitIntoBubbles(text: string): string[] {
-	// First split on explicit --- separator
-	const explicitBubbles = text
-		.split(/\n[ \t]*---[ \t]*\n/)
-		.map((s) => s.trim())
-		.filter((s) => s.length > 0);
-
-	// If the model used ---, honour those splits only
-	if (explicitBubbles.length > 1) return explicitBubbles;
-
-	// Otherwise fall back to paragraph breaks (\n\n)
-	return text
-		.split(/\n\n+/)
-		.map((s) => s.trim())
-		.filter((s) => s.length > 0);
-}
-
-// Compute a realistic typing delay before sending a bubble (simulates human typing).
-function typingDelayMs(text: string): number {
-	if (!MOM_WA_BUBBLE_DELAY_ENABLED) {
-		return 0;
-	}
-	const ms = text.length * MOM_WA_BUBBLE_DELAY_PER_CHAR_MS;
-	return Math.min(Math.max(ms, MOM_WA_BUBBLE_DELAY_MIN_MS), MOM_WA_BUBBLE_DELAY_MAX_MS);
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function awaitRunTermination(
