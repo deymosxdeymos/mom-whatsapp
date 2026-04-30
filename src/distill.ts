@@ -281,7 +281,7 @@ async function resolveDistillModelAndKey(): Promise<{ model: Model<Api>; apiKey:
 	const secondaryAuthPath = getSecondaryAuthJsonPath(primaryAuthPath);
 	const primaryAuthStorage = AuthStorage.create(primaryAuthPath);
 	const secondaryAuthStorage = AuthStorage.create(secondaryAuthPath);
-	const modelRegistry = new ModelRegistry(primaryAuthStorage);
+	const modelRegistry = ModelRegistry.inMemory(primaryAuthStorage);
 	const model = resolveModelOrThrow(modelRegistry, configured.provider, configured.modelId);
 	const apiKey = await getApiKeyForProvider(configured.provider, primaryAuthStorage, secondaryAuthStorage);
 	return { model, apiKey };

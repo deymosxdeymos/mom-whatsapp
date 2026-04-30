@@ -1,7 +1,8 @@
 import { Agent, type AgentEvent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { type Api, type ImageContent, type Model } from "@mariozechner/pi-ai";
+import { type Api, type AssistantMessage, type ImageContent, type Model, type TextContent, type ThinkingContent } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
+	type AgentSessionEvent,
 	AuthStorage,
 	convertToLlm,
 	createExtensionRuntime,
@@ -10,6 +11,7 @@ import {
 	ModelRegistry,
 	type ResourceLoader,
 	SessionManager,
+	SettingsManager,
 	type Skill,
 } from "@mariozechner/pi-coding-agent";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
@@ -966,7 +968,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const secondaryAuthPath = primaryAuthPath === agentAuth ? momWhatsappAuth : agentAuth;
 	const authStorage = AuthStorage.create(primaryAuthPath);
 	const secondaryAuthStorage = AuthStorage.create(secondaryAuthPath);
-	const modelRegistry = new ModelRegistry(authStorage);
+	const modelRegistry = ModelRegistry.inMemory(authStorage);
 	let currentModel = resolveModelOrThrow(modelRegistry, configured.provider, configured.modelId);
 	const secondaryRuntimeProviders = new Set<string>();
 
@@ -1035,7 +1037,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 	const loadedSession = sessionManager.buildSessionContext();
 	if (loadedSession.messages.length > 0) {
 		const sanitizedMessages = sanitizeLoadedMessages(loadedSession.messages, channelId);
-		agent.replaceMessages(sanitizedMessages);
+		agent.state.messages = sanitizedMessages;
 		log.logInfo(`[${channelId}] Loaded ${sanitizedMessages.length} messages from context.jsonl`);
 	}
 
@@ -1047,18 +1049,23 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		getAgentsFiles: () => ({ agentsFiles: [] }),
 		getSystemPrompt: () => systemPrompt,
 		getAppendSystemPrompt: () => [],
-		getPathMetadata: () => new Map(),
 		extendResources: () => {},
 		reload: async () => {},
 	};
 
 	const baseToolsOverride = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
-	// Create AgentSession wrapper
+	// Create AgentSession wrapper — use inMemory SettingsManager so AgentSession
+	// has the shell/compaction/retry APIs it needs. MomSettingsManager handles our
+	// own persistence (model preferences, thinking level) separately.
+	const agentSettings = SettingsManager.inMemory({
+		compaction: { enabled: true },
+		retry: { enabled: true, maxRetries: 3 },
+	});
 	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settingsManager: settingsManager as any,
+		settingsManager: agentSettings,
 		cwd: process.cwd(),
 		modelRegistry,
 		resourceLoader,
@@ -1177,7 +1184,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		} else if (event.type === "message_end") {
 			const agentEvent = event as AgentEvent & { type: "message_end" };
 			if (agentEvent.message.role === "assistant") {
-				const assistantMsg = agentEvent.message as any;
+				const assistantMsg = agentEvent.message as AssistantMessage;
 
 				if (assistantMsg.stopReason) {
 					runState.stopReason = assistantMsg.stopReason;
@@ -1206,9 +1213,9 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				const textParts: string[] = [];
 				for (const part of content) {
 					if (part.type === "thinking") {
-						thinkingParts.push((part as any).thinking);
+						thinkingParts.push((part as ThinkingContent).thinking);
 					} else if (part.type === "text") {
-						textParts.push((part as any).text);
+						textParts.push((part as TextContent).text);
 					}
 				}
 
@@ -1234,18 +1241,18 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 					}
 				}
 			}
-		} else if (event.type === "auto_compaction_start") {
-			log.logInfo(`Auto-compaction started (reason: ${(event as any).reason})`);
+		} else if (event.type === "compaction_start") {
+			log.logInfo(`Compaction started (reason: ${(event as AgentSessionEvent & { type: "compaction_start" }).reason})`);
 			queue.enqueue(() => ctx.respond("_Compacting context..._", false), "compaction start");
-		} else if (event.type === "auto_compaction_end") {
-			const compEvent = event as any;
+		} else if (event.type === "compaction_end") {
+			const compEvent = event as AgentSessionEvent & { type: "compaction_end" };
 			if (compEvent.result) {
 				log.logInfo(`Auto-compaction complete: ${compEvent.result.tokensBefore} tokens compacted`);
 			} else if (compEvent.aborted) {
 				log.logInfo("Auto-compaction aborted");
 			}
 		} else if (event.type === "auto_retry_start") {
-			const retryEvent = event as any;
+			const retryEvent = event as AgentSessionEvent & { type: "auto_retry_start" };
 			log.logWarning(`Retrying (${retryEvent.attempt}/${retryEvent.maxAttempts})`, retryEvent.errorMessage);
 			queue.enqueue(
 				() => ctx.respond(`_Retrying (${retryEvent.attempt}/${retryEvent.maxAttempts})..._`, false),
@@ -1279,7 +1286,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		}
 
 		const restored = sessionManager.buildSessionContext();
-		agent.replaceMessages(restored.messages);
+		agent.state.messages = restored.messages;
 	};
 
 	return {
@@ -1303,7 +1310,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			const reloadedSession = sessionManager.buildSessionContext();
 			if (reloadedSession.messages.length > 0) {
 				const sanitizedMessages = sanitizeLoadedMessages(reloadedSession.messages, channelId);
-				agent.replaceMessages(sanitizedMessages);
+				agent.state.messages = sanitizedMessages;
 				log.logInfo(`[${channelId}] Reloaded ${sanitizedMessages.length} messages from context`);
 			}
 
@@ -1321,7 +1328,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				ctx.users,
 				skills,
 			);
-			session.agent.setSystemPrompt(systemPrompt);
+			session.agent.state.systemPrompt = systemPrompt;
 
 			// Set up file upload function for this run
 			runUploadState.fn = async (filePath: string, title?: string) => {
@@ -1515,7 +1522,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				const lastAssistantMessage = messages
 					.slice()
 					.reverse()
-					.find((m) => m.role === "assistant" && (m as any).stopReason !== "aborted") as any;
+					.find((m): m is AssistantMessage => m.role === "assistant" && (m as AssistantMessage).stopReason !== "aborted");
 
 				const contextTokens = lastAssistantMessage
 					? lastAssistantMessage.usage.input +
@@ -1558,7 +1565,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			currentModel = resolved;
 			currentModelProvider = provider;
 			currentModelId = modelId;
-			agent.setModel(resolved);
+			agent.state.model = resolved;
 			settingsManager.setDefaultModelAndProvider(provider, modelId);
 			return { provider, modelId };
 		},
@@ -1588,7 +1595,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 
 		setThinkingLevel(level: ThinkingLevel): ThinkingLevel {
 			currentThinkingLevel = level;
-			agent.setThinkingLevel(level);
+			agent.state.thinkingLevel = level;
 			settingsManager.setDefaultThinkingLevel(level);
 			return level;
 		},
@@ -1631,7 +1638,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				at: new Date(resetTsMs).toISOString(),
 				reason: "manual-reset",
 			});
-			agent.replaceMessages([]);
+			agent.state.messages = [];
 			log.logInfo(`[${channelId}] Session reset; previous entries: ${previousEntryCount}`);
 			return { previousEntryCount };
 		},

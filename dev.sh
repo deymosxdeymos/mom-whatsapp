@@ -25,7 +25,7 @@ else
     --name "$CONTAINER_NAME" \
     --security-opt label=disable \
     -v "$DATA_DIR:/workspace" \
-    debian:bookworm-slim \
+    debian:trixie-slim \
     tail -f /dev/null
   echo "Installing runtime dependencies in $CONTAINER_NAME"
   docker exec "$CONTAINER_NAME" /bin/sh -lc "set -e; apt-get update >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nodejs npm python3 python3-venv unzip poppler-utils >/dev/null; curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null; ln -sf /root/.local/bin/uv /usr/local/bin/uv; ln -sf /root/.local/bin/uvx /usr/local/bin/uvx"

@@ -1,8 +1,7 @@
 import makeWASocket, {
-	Browsers,
 	DisconnectReason,
 	downloadMediaMessage,
-	fetchLatestWaWebVersion,
+	fetchLatestBaileysVersion,
 	makeCacheableSignalKeyStore,
 	normalizeMessageContent,
 	type proto,
@@ -120,6 +119,10 @@ interface WhatsAppBotConfig {
 	deps?: Partial<WhatsAppDependencies>;
 }
 
+function isAuthInitialized(creds: { registered?: boolean; me?: unknown }): boolean {
+	return creds.registered === true || Boolean(creds.me);
+}
+
 interface LIDResolver {
 	lidMapping?: {
 		getPNForLID?: (jid: string) => Promise<string | undefined>;
@@ -195,16 +198,16 @@ export class WhatsAppBot {
 
 	private async connect(onFirstOpen?: () => void): Promise<void> {
 		const { state, saveCreds } = await this.deps.useAuthState(this.config.authDir);
-		if (state.creds.registered !== true) {
+		if (!isAuthInitialized(state.creds)) {
 			log.logWarning("WhatsApp auth required. Run `npm run wa:auth` before starting mom-whatsapp.");
 			throw new Error("WhatsApp auth not initialized");
 		}
 
-		const { version, isLatest } = await fetchLatestWaWebVersion().catch(() => ({
+		const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({
 			version: [2, 3000, 1027934701] as [number, number, number],
 			isLatest: false,
 		}));
-		log.logInfo(`Using WA version ${version.join(".")} (isLatest: ${isLatest})`);
+		log.logInfo(`Using Baileys WA version ${version.join(".")} (isLatest: ${isLatest})`);
 		this.sock = this.deps.makeSocket({
 			auth: {
 				creds: state.creds,
@@ -212,7 +215,9 @@ export class WhatsAppBot {
 			},
 			version,
 			printQRInTerminal: false,
-			browser: Browsers.macOS("Chrome"),
+			browser: ["mom-whatsapp", "cli", "0.54.1"],
+			syncFullHistory: false,
+			markOnlineOnConnect: false,
 		});
 
 		this.sock.ev.on("creds.update", saveCreds);

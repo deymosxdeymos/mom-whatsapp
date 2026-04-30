@@ -10,13 +10,14 @@ import { appendFile, readFile, writeFile } from "fs/promises";
 import { join, resolve } from "path";
 import { buildArtifactUrl, getArtifactsBaseUrl, getArtifactsRoot } from "./artifacts.js";
 import { type AgentRunner, getOrCreateRunner, type RunnerSessionStats, translateToHostPath } from "./agent.js";
+import { type ChannelRuntime, getOrCreateChannelRuntime, runtimes } from "./channel-runtime.js";
 import { createEventsWatcher } from "./events.js";
 import { distillExportFileToWorkspace } from "./distill.js";
-import { removeGroupHistoryEntries } from "./group-history.js";
 import { createIpcWatcher } from "./ipc.js";
 import { normalizeWhatsAppJid } from "./jid.js";
 import { parseModelSpecWithAliases } from "./model-aliases.js";
 import { shouldClearPendingGroupHistory } from "./pending-group-history.js";
+import type { GroupHistoryEntry } from "./group-history.js";
 import * as log from "./log.js";
 import {
 	createImmediateTaskEvent,
@@ -139,43 +140,14 @@ const { workingDir, sandbox } = { workingDir: parsedArgs.workingDir, sandbox: pa
 await validateSandbox(sandbox, workingDir);
 await ensureWorkspaceBootstrapFiles(workingDir);
 
-interface ChannelState {
-	running: boolean;
-	runner: AgentRunner;
-	store: ChannelStore;
-	stopRequested: boolean;
-}
-
-const channelStates = new Map<string, ChannelState>();
-
-function getState(channelId: string): ChannelState {
-	let state = channelStates.get(channelId);
-	if (!state) {
-		const channelDir = join(workingDir, channelId);
-		state = {
-			running: false,
-			runner: getOrCreateRunner(sandbox, channelId, channelDir),
-			store: new ChannelStore({ workingDir }),
-			stopRequested: false,
-		};
-		channelStates.set(channelId, state);
-	}
-	return state;
-}
-
-async function clearPendingGroupHistoryForEvent(event: WhatsAppEvent, state: ChannelState): Promise<void> {
-	if (!shouldClearPendingGroupHistory(event)) {
-		return;
-	}
-
-	try {
-		await removeGroupHistoryEntries(state.store.getChannelDir(event.channel), event.pendingHistory);
-	} catch (err) {
-		log.logWarning(
-			`[${event.channel}] Failed to clear pending group history`,
-			err instanceof Error ? err.message : String(err),
-		);
-	}
+async function getRuntime(channelId: string): Promise<ChannelRuntime> {
+	const channelDir = join(workingDir, channelId);
+	return getOrCreateChannelRuntime(
+		channelId,
+		getOrCreateRunner(sandbox, channelId, channelDir),
+		new ChannelStore({ workingDir }),
+		workingDir,
+	);
 }
 
 function parseCommand(text: string): { name: string; args: string[] } | null {
@@ -358,7 +330,7 @@ function formatHelp(): string {
 	].join("\n");
 }
 
-async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: WhatsAppBot): Promise<boolean> {
+async function handleCommand(event: WhatsAppEvent, runtime: ChannelRuntime, wa: WhatsAppBot): Promise<boolean> {
 	const command = parseCommand(event.text);
 	if (!command) return false;
 
@@ -368,8 +340,8 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 	}
 
 	if (command.name === "status") {
-		const model = state.runner.getModel();
-		const thinking = state.runner.getThinkingLevel();
+		const model = runtime.runner.getModel();
+		const thinking = runtime.runner.getThinkingLevel();
 		const ownerScoped = MOM_WA_OWNER_JIDS.size > 0;
 		const artifactBaseUrl = await getArtifactsBaseUrl();
 		const status = [
@@ -389,7 +361,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 
 	if (command.name === "providers" || command.name === "models") {
 		try {
-			const available = await state.runner.getAvailableProviderModels();
+			const available = await runtime.runner.getAvailableProviderModels();
 			await wa.postMessage(event.channel, formatProvidersList(available));
 		} catch (err) {
 			await wa.postMessage(event.channel, `_Failed to list providers:_ ${err instanceof Error ? err.message : String(err)}`);
@@ -399,7 +371,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 
 	if (command.name === "model") {
 		if (command.args.length === 0) {
-			const current = state.runner.getModel();
+			const current = runtime.runner.getModel();
 			await wa.postMessage(event.channel, `Model: ${current.provider}/${current.modelId}`);
 			return true;
 		}
@@ -412,7 +384,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			modelId: "claude-sonnet-4-6",
 		});
 		try {
-			const updated = state.runner.setModel(resolvedSpec.provider, resolvedSpec.modelId);
+			const updated = runtime.runner.setModel(resolvedSpec.provider, resolvedSpec.modelId);
 			await wa.postMessage(event.channel, `Model set: ${updated.provider}/${updated.modelId}`);
 		} catch (err) {
 			await wa.postMessage(
@@ -425,7 +397,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 
 	if (command.name === "thinking") {
 		if (command.args.length === 0) {
-			await wa.postMessage(event.channel, `Thinking: ${state.runner.getThinkingLevel()}`);
+			await wa.postMessage(event.channel, `Thinking: ${runtime.runner.getThinkingLevel()}`);
 			return true;
 		}
 		if (!isOwnerJid(event.user)) {
@@ -438,13 +410,13 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			await wa.postMessage(event.channel, "_Invalid thinking level. Use off|minimal|low|medium|high|xhigh_");
 			return true;
 		}
-		state.runner.setThinkingLevel(level as Parameters<AgentRunner["setThinkingLevel"]>[0]);
+		runtime.runner.setThinkingLevel(level as Parameters<AgentRunner["setThinkingLevel"]>[0]);
 		await wa.postMessage(event.channel, `Thinking set: ${level}`);
 		return true;
 	}
 
 	if (
-		await handleWorkspaceCommand(command, event, state, wa, {
+		await handleWorkspaceCommand(command, event, runtime, wa, {
 			workingDir,
 			isOwnerJid,
 		})
@@ -713,7 +685,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 	if (command.name === "session") {
 		const sub = command.args[0]?.toLowerCase() || "status";
 		if (sub === "status") {
-			await wa.postMessage(event.channel, formatSessionStatus(state.runner.getSessionStats()));
+			await wa.postMessage(event.channel, formatSessionStatus(runtime.runner.getSessionStats()));
 			return true;
 		}
 		if (sub === "reset") {
@@ -721,7 +693,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 				await wa.postMessage(event.channel, "_Only configured owner JIDs can reset session context._");
 				return true;
 			}
-			const result = state.runner.resetSession();
+			const result = runtime.runner.resetSession();
 			await wa.postMessage(
 				event.channel,
 				`Session reset. Previous entry count: ${result.previousEntryCount}. Next messages start a fresh context.`,
@@ -760,7 +732,7 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 			const normalizedRequestedPath = requestedPath.replace(/\\/g, "/");
 			if (sandbox.type === "docker" && normalizedRequestedPath.startsWith("/workspace")) {
 				try {
-					resolvedArtifactPath = translateToHostPath(requestedPath, state.store.getChannelDir(event.channel), "/workspace");
+					resolvedArtifactPath = translateToHostPath(requestedPath, runtime.store.getChannelDir(event.channel), "/workspace");
 				} catch (err) {
 					await wa.postMessage(
 						event.channel,
@@ -795,12 +767,12 @@ async function handleCommand(event: WhatsAppEvent, state: ChannelState, wa: What
 function createWhatsAppContext(
 	event: WhatsAppEvent,
 	wa: WhatsAppBot,
-	state: ChannelState,
+	runtime: ChannelRuntime,
 	hooks?: { onOutput?: () => void; onToolExecution?: () => void },
 ) {
 	// Seed display names from the channel log so users who haven't messaged this
 	// session still appear with their real names (not just phone numbers).
-	const logPath = join(state.store.getChannelDir(event.channel), "log.jsonl");
+	const logPath = join(runtime.store.getChannelDir(event.channel), "log.jsonl");
 	wa.seedUsersFromLog(logPath);
 
 	const user = wa.getUser(event.user);
@@ -845,7 +817,7 @@ function createWhatsAppContext(
 			attachments: (event.attachments || []).map((a) => ({ local: a.local })),
 		},
 		channelName: wa.getChannel(event.channel)?.name,
-		store: state.store,
+		store: runtime.store,
 		channels: wa.getAllChannels().map((c) => ({ id: c.id, name: c.name })),
 		users: wa.getAllUsers().map((u) => ({ id: u.id, userName: u.userName, displayName: u.displayName })),
 
@@ -904,15 +876,15 @@ function createWhatsAppContext(
 
 const handler: MomHandler = {
 	isRunning(channelId: string): boolean {
-		const state = channelStates.get(channelId);
-		return state?.running ?? false;
+		const runtime = runtimes.get(channelId);
+		return runtime?.isRunning ?? false;
 	},
 
 	async handleStop(channelId: string, wa: WhatsAppBot): Promise<void> {
-		const state = channelStates.get(channelId);
-		if (state?.running) {
-			state.stopRequested = true;
-			state.runner.abort();
+		const runtime = runtimes.get(channelId);
+		if (runtime?.isRunning) {
+			runtime.stopRequested = true;
+			runtime.runner.abort();
 			await wa.postMessage(channelId, "_Stopping..._");
 		} else {
 			await wa.postMessage(channelId, "_Nothing running_");
@@ -920,10 +892,12 @@ const handler: MomHandler = {
 	},
 
 	async handleEvent(event: WhatsAppEvent, wa: WhatsAppBot): Promise<void> {
-		const state = getState(event.channel);
-		const commandHandled = await handleCommand(event, state, wa);
+		const runtime = await getRuntime(event.channel);
+		const commandHandled = await handleCommand(event, runtime, wa);
 		if (commandHandled) {
-			await clearPendingGroupHistoryForEvent(event, state);
+			if (shouldClearPendingGroupHistory(event)) {
+				await runtime.clearPendingHistory(event.pendingHistory);
+			}
 			return;
 		}
 
@@ -932,18 +906,18 @@ const handler: MomHandler = {
 			await wa.reactToMessage(event.channel, event.messageKey, emoji);
 		};
 
-		state.running = true;
-		state.stopRequested = false;
-		let shouldClearConsumedPendingGroupHistory = false;
+		runtime.running = true;
+		runtime.stopRequested = false;
+		let consumedPendingGroupHistory: GroupHistoryEntry[] = [];
 
 		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
 
 		await react("⏳");
 
-		const retryCheckpoint = state.runner.createCheckpoint();
+		const retryCheckpoint = runtime.runner.createCheckpoint();
 		const rollbackBeforeRetry = (): boolean => {
 			try {
-				state.runner.restoreCheckpoint(retryCheckpoint);
+				runtime.runner.restoreCheckpoint(retryCheckpoint);
 				return true;
 			} catch (err) {
 				log.logWarning(
@@ -964,7 +938,7 @@ const handler: MomHandler = {
 			let runPromise: Promise<{ stopReason: string; errorMessage?: string }> | null = null;
 
 			try {
-				ctx = createWhatsAppContext(event, wa, state, {
+				ctx = createWhatsAppContext(event, wa, runtime, {
 					onOutput: () => {
 						outputSentToUser = true;
 					},
@@ -977,11 +951,11 @@ const handler: MomHandler = {
 
 				// Race the run against a hard timeout — prevents the bot getting stuck forever.
 				let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-				runPromise = state.runner.run(ctx, state.store);
+				runPromise = runtime.runner.run(ctx, runtime.store);
 				const timeoutPromise = new Promise<never>((_, reject) => {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
-						state.runner.abort();
+						runtime.runner.abort();
 						reject(new Error(`timed out after ${MOM_WA_RUN_TIMEOUT_MS / 1000}s`));
 					}, MOM_WA_RUN_TIMEOUT_MS);
 				});
@@ -1002,7 +976,7 @@ const handler: MomHandler = {
 					break;
 				}
 
-				if (result.stopReason === "aborted" && state.stopRequested) {
+				if (result.stopReason === "aborted" && runtime.stopRequested) {
 					await wa.postMessage(event.channel, "stopped");
 					await react("⏹️");
 					break;
@@ -1012,9 +986,9 @@ const handler: MomHandler = {
 					const isRateLimit = isRateLimitErrorText(result.errorMessage);
 					// Retry only before user-visible output and before any tool execution.
 					// This avoids re-running non-idempotent tool actions after partial progress.
-					if (!outputSentToUser && !hadToolExecution && !state.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
+					if (!outputSentToUser && !hadToolExecution && !runtime.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
 						if (!rollbackBeforeRetry()) {
-							if (!outputSentToUser && !state.stopRequested) {
+							if (!outputSentToUser && !runtime.stopRequested) {
 								await wa.postMessage(event.channel, "something went wrong, try again");
 							}
 							await react("❌");
@@ -1027,14 +1001,14 @@ const handler: MomHandler = {
 						await sleep(delayMs);
 						continue;
 					}
-					if (!outputSentToUser && !state.stopRequested) {
+					if (!outputSentToUser && !runtime.stopRequested) {
 						await wa.postMessage(event.channel, isRateLimit ? "api lagi padat, coba lagi bentar" : "something went wrong, try again");
 					}
 					await react("❌");
 					break;
 				}
 
-				shouldClearConsumedPendingGroupHistory = shouldClearPendingGroupHistory(event);
+				consumedPendingGroupHistory = shouldClearPendingGroupHistory(event) ? event.pendingHistory : [];
 				await react("✅");
 				break;
 			} catch (err) {
@@ -1055,9 +1029,9 @@ const handler: MomHandler = {
 				log.logWarning(`[${event.channel}] Run error (attempt ${attempt}/${RUN_MAX_RETRIES})`, errMsg);
 				const isRateLimit = isRateLimitErrorText(errMsg);
 
-				if (!outputSentToUser && !hadToolExecution && !state.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
+				if (!outputSentToUser && !hadToolExecution && !runtime.stopRequested && !isRateLimit && attempt < RUN_MAX_RETRIES) {
 					if (!rollbackBeforeRetry()) {
-						if (!outputSentToUser && !state.stopRequested) {
+						if (!outputSentToUser && !runtime.stopRequested) {
 							await wa.postMessage(event.channel, "something went wrong, try again");
 						}
 						await react("❌");
@@ -1088,11 +1062,11 @@ const handler: MomHandler = {
 			}
 		}
 
-		if (shouldClearConsumedPendingGroupHistory) {
-			await clearPendingGroupHistoryForEvent(event, state);
+		if (consumedPendingGroupHistory.length > 0) {
+			await runtime.clearPendingHistory(consumedPendingGroupHistory);
 		}
 
-		state.running = false;
+		runtime.running = false;
 	},
 };
 

@@ -3,9 +3,8 @@
 import * as readline from "node:readline";
 import { mkdirSync } from "node:fs";
 import makeWASocket, {
-	Browsers,
 	DisconnectReason,
-	fetchLatestWaWebVersion,
+	fetchLatestBaileysVersion,
 	makeCacheableSignalKeyStore,
 	useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
@@ -77,17 +76,23 @@ async function connectSocket(phoneNumber: string | undefined, usePairingCode: bo
 	}
 
 	const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+	let saveQueue: Promise<void> = Promise.resolve();
+	const enqueueSaveCreds = (): void => {
+		saveQueue = saveQueue.then(() => Promise.resolve(saveCreds())).catch((err) => {
+			console.error(`Failed to save WhatsApp creds: ${getDisconnectMessage(err)}`);
+		});
+	};
 	if (state.creds.registered === true && !isReconnect) {
 		console.log("✓ Already authenticated with WhatsApp");
 		console.log("  Run mom-whatsapp directly.");
 		process.exit(0);
 	}
 
-	const { version, isLatest } = await fetchLatestWaWebVersion().catch(() => ({
+	const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({
 		version: [2, 3000, 1027934701] as [number, number, number],
 		isLatest: false,
 	}));
-	console.log(`Using WA version ${version.join(".")} (isLatest: ${isLatest})`);
+	console.log(`Using Baileys WA version ${version.join(".")} (isLatest: ${isLatest})`);
 
 	const sock = makeWASocket({
 		auth: {
@@ -96,7 +101,9 @@ async function connectSocket(phoneNumber: string | undefined, usePairingCode: bo
 		},
 		version,
 		printQRInTerminal: false,
-		browser: Browsers.macOS("Chrome"),
+		browser: ["mom-whatsapp", "cli", "0.54.1"],
+		syncFullHistory: false,
+		markOnlineOnConnect: false,
 	});
 
 	let pairingCodeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -121,6 +128,9 @@ async function connectSocket(phoneNumber: string | undefined, usePairingCode: bo
 
 	sock.ev.on("connection.update", (update) => {
 		const { connection, lastDisconnect, qr } = update;
+		console.log(
+			`connection.update: connection=${connection ?? "none"} qr=${qr ? "yes" : "no"} status=${getDisconnectStatusCode(lastDisconnect?.error) ?? "none"} message=${lastDisconnect?.error ? getDisconnectMessage(lastDisconnect.error) : "none"}`,
+		);
 
 		if (qr && !usePairingCode) {
 			console.log("Scan this QR code with WhatsApp:\n");
@@ -150,8 +160,12 @@ async function connectSocket(phoneNumber: string | undefined, usePairingCode: bo
 			}
 
 			if (statusCode === 515) {
-				console.log("⟳ Stream error (515) after pairing — reconnecting...");
-				void connectSocket(phoneNumber, usePairingCode, true);
+				console.log("⟳ WhatsApp requested restart after pairing (515); waiting for creds save, then reconnecting...");
+				void (async () => {
+					await saveQueue;
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+					await connectSocket(phoneNumber, usePairingCode, true);
+				})();
 				return;
 			}
 
@@ -171,7 +185,8 @@ async function connectSocket(phoneNumber: string | undefined, usePairingCode: bo
 	});
 
 	sock.ev.on("creds.update", () => {
-		void saveCreds();
+		console.log("creds.update: saving credentials");
+		enqueueSaveCreds();
 	});
 }
 
